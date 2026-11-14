@@ -10,6 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.43.0] — 2026-11-14
+
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
 
 ### Added
