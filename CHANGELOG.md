@@ -10,6 +10,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
+
+### Added
+
+- **A shared console device per node for tools on the BMC: `/dev/ttyNode1` to
+  `/dev/ttyNode4`.** `microcom` or `picocom` on `/dev/ttyS1` read the same UART
+  as the daemon, so every character went to one reader or the other and a line
+  came out split between the terminal and the web console. The daemon now makes
+  a pseudo-terminal for each node when it starts, with a stable symlink to it,
+  and puts everything the node sends on it as well as in the web console. What
+  is typed in a terminal on the device reaches the node, as typing in the web
+  console does, so both show the same thing. Open `/dev/ttyNodeN` instead of
+  `/dev/ttyS*`; the daemon's lock on the `ttyS*` ports stays, and means just
+  that. A terminal program's own speed setting has no effect on it: the speed
+  is the node's `uart_baud` setting. Nobody has to be reading: output that
+  nobody takes is dropped and never holds up the node's other readers.
+  One line per node in the log says where the device is.
+
+### Fixed
+
+- **The serial speed of a node was stored and never used.** `uart_baud` in a
+  node's settings was kept and shown but every port was opened at 115200
+  whatever it said. The port now opens at the stored speed (115200 when there
+  is none) and follows a change as soon as it is made, without restarting the
+  daemon or disconnecting the web console. A value that is not a standard rate
+  (300 to 3000000, which includes 1500000) is now refused with a `400` that
+  names the node and the rates, and nothing in that request is changed.
+  `GET /api/bmc/nodes` shows it as `uart_baud`, `null` for the default.
+- **`tpi about` showed `board ����` on a board whose information EEPROM was
+  never programmed.** The serial number was already cleaned of padding; the
+  model name was not, nor the hardware revision, which read as `v31.31.63` on
+  an erased EEPROM. Both are now empty, as they are when the EEPROM cannot be
+  read, and text that is noise in the middle is not shown either.
+
 ## [2.42.2] — 2026-11-01
 
 ### Fixed

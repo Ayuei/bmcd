@@ -159,7 +159,10 @@ async fn main() -> anyhow::Result<()> {
     storage.log_startup().await;
 
     let bmc = Data::new(BmcApplication::new(config.store.write_timeout).await?);
-    let serial_service = Data::new(SerialConnections::new());
+    // Each port opens at the speed stored for its node, 115200 when there is
+    // none, and follows the setting from then on.
+    let serial_service = Data::new(SerialConnections::new(bmc.node_bauds().await));
+    bmc.attach_serial(serial_service.clone().into_inner());
     let streaming_data_service = Data::new(StreamingDataService::new());
     let authentication = Arc::new(
         LinuxAuthenticator::new(
