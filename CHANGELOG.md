@@ -78,6 +78,24 @@ commits are in those pull requests.
   field left out of a request still keeps what is stored. A configuration
   import behaves as before: a file with no speed for a node leaves it alone.
 
+### Added
+
+- **LACP (`SecondUplink::Lag`) on Flat and Trunk.** `bond0` (802.3ad) carries
+  the uplink VLANs; ge0/ge1 are empty slaves. The presets list shows them as
+  `flat-lag` / `trunk-lag`; the value to send is the preset's `preset` field,
+  e.g. `{"preset":"flat","second_uplink":"lag"}`. Confirm requires ifupdown-ng's bond executor. The confirm
+  window watches `bond0`. A failed apply runs a best-effort inverse plan.
+  Split remains incompatible with LAG. Older `switch.json` files without
+  `second_uplink` infer Off/Redundant/Lag from ports and STP.
+
+- **Switch confirm dual-writes `/etc/network/interfaces`.** One locked writer
+  shared with address confirm. A `# bmcd-switch:` header carries the
+  document; bond0 / `bridge-ports` / `post-up` hooks come from
+  `plan(flat-with-same-uplink, confirmed)`. Boot heal skips when the file
+  matches; otherwise rewrites (never a hand-written file without
+  `replace_hand_written`) and plans from the header or image Flat. Safe mode
+  skips heal.
+
 ## [2.43.0] — 2026-11-14
 
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
