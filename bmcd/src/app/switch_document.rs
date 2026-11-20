@@ -792,7 +792,7 @@ mod tests {
         let split = Preset::Split.expand();
         let mut value = serde_json::to_value(&split).unwrap();
         value.as_object_mut().unwrap().remove("second_uplink");
-        let loaded = SwitchDocument::from_json_value(value).expect("load");
+        let loaded = serde_json::from_value::<SwitchDocument>(value).expect("load");
         assert_eq!(loaded.second_uplink, SecondUplink::Off);
         assert_eq!(loaded, split);
     }
