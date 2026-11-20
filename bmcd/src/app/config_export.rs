@@ -38,7 +38,7 @@
 //! values are read through `get_node_infos()`, which is the one place that
 //! already knows those types.
 
-use crate::app::bmc_application::{BmcApplication, NodeInfo};
+use crate::app::bmc_application::{BmcApplication, NodeInfoUpdate};
 use crate::hal::NodeId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -203,7 +203,7 @@ pub async fn import(bmc: &BmcApplication, document: &ConfigExport) -> Result<Imp
     }
 
     if let Some(nodes) = &document.nodes {
-        let mut infos: HashMap<NodeId, NodeInfo> = HashMap::new();
+        let mut infos: HashMap<NodeId, NodeInfoUpdate> = HashMap::new();
         let mut rejected = Vec::new();
         for node in nodes {
             let Some(id) = node_id(node.id) else {
@@ -212,14 +212,12 @@ pub async fn import(bmc: &BmcApplication, document: &ConfigExport) -> Result<Imp
             };
             infos.insert(
                 id,
-                NodeInfo {
+                NodeInfoUpdate {
                     name: node.name.clone(),
                     module_name: node.module_name.clone(),
-                    // Never imported: it is when THIS board last powered the
-                    // node on, and carrying it to another board would report
-                    // an uptime that never happened.
-                    power_on_time: None,
-                    uart_baud: node.uart_baud,
+                    // An export without a speed keeps the one on this board,
+                    // as before: only a speed in the file is applied.
+                    uart_baud: node.uart_baud.map(Some),
                 },
             );
         }

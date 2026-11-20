@@ -104,8 +104,25 @@ pub struct NodeInfo {
     /// disconnecting the web console, and again at every start of the
     /// daemon. Local tools on the BMC read the same console at
     /// `/dev/ttyNode1` to `/dev/ttyNode4` and cannot change the speed
-    /// themselves.
+    /// themselves. Posting `null` for it clears the stored speed and goes
+    /// back to the default; leaving it out of a request keeps the speed.
     pub uart_baud: Option<u32>,
+}
+
+/// What a request to change a node's settings may carry. Apart from
+/// [`NodeInfo`] because a request needs three states for `uart_baud` where
+/// the stored setting has two: left out (keep it), a speed (set it) and
+/// `null` (clear it, back to the default). `Option<u32>` cannot tell the
+/// first from the last, which is how a posted `null` came to be accepted and
+/// ignored.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct NodeInfoUpdate {
+    pub name: Option<String>,
+    pub module_name: Option<String>,
+    /// `None` keeps the stored speed, `Some(None)` clears it, `Some(Some(b))`
+    /// sets it.
+    #[serde(default, with = "serde_with::rust::double_option")]
+    pub uart_baud: Option<Option<u32>>,
 }
 
 /// A node setting that cannot be accepted. A caller's mistake, answered as a
@@ -121,11 +138,13 @@ pub struct NodeInfoRequestError {
 
 /// Checks every setting in a request before any of it is stored, so a
 /// request with one bad value changes nothing.
-fn validate_node_infos(infos: &HashMap<NodeId, NodeInfo>) -> Result<(), NodeInfoRequestError> {
+fn validate_node_infos(
+    infos: &HashMap<NodeId, NodeInfoUpdate>,
+) -> Result<(), NodeInfoRequestError> {
     let mut nodes: Vec<_> = infos.iter().collect();
     nodes.sort_by_key(|(node, _)| **node as usize);
     for (node, info) in nodes {
-        if let Some(baud) = info.uart_baud {
+        if let Some(Some(baud)) = info.uart_baud {
             validate_baud(baud).map_err(|source| NodeInfoRequestError {
                 node: *node as usize + 1,
                 source,
@@ -133,6 +152,33 @@ fn validate_node_infos(infos: &HashMap<NodeId, NodeInfo>) -> Result<(), NodeInfo
         }
     }
     Ok(())
+}
+
+/// Applies a request to the stored settings and returns the serial speeds
+/// the open ports are to be moved to: the one that was set, or the default for
+/// a node whose speed was cleared with `null`.
+fn apply_node_updates(
+    stored: &mut NodeInfos,
+    updates: HashMap<NodeId, NodeInfoUpdate>,
+) -> Vec<(NodeId, u32)> {
+    let mut new_bauds = Vec::new();
+    for (node, info) in updates {
+        let store_node = &mut stored[node as usize];
+
+        if let Some(name) = info.name {
+            store_node.name = Some(name);
+        }
+
+        if let Some(module_name) = info.module_name {
+            store_node.module_name = Some(module_name);
+        }
+
+        if let Some(uart_baud) = info.uart_baud {
+            store_node.uart_baud = uart_baud;
+            new_bauds.push((node, effective_baud(uart_baud)));
+        }
+    }
+    new_bauds
 }
 
 /// Where the node power state applied on start of the daemon comes from.
@@ -573,27 +619,14 @@ impl BmcApplication {
     }
 
     #[instrument(skip(self))]
-    pub async fn set_node_info(&self, new_info: HashMap<NodeId, NodeInfo>) -> anyhow::Result<()> {
+    pub async fn set_node_info(
+        &self,
+        new_info: HashMap<NodeId, NodeInfoUpdate>,
+    ) -> anyhow::Result<()> {
         validate_node_infos(&new_info)?;
         let mut stored_nodes = self.app_db.get::<NodeInfos>(NODE_INFO_KEY).await;
 
-        let mut new_bauds = Vec::new();
-        for (node, info) in new_info {
-            let store_node = &mut stored_nodes[node as usize];
-
-            if let Some(name) = info.name {
-                store_node.name = Some(name);
-            }
-
-            if let Some(module_name) = info.module_name {
-                store_node.module_name = Some(module_name);
-            }
-
-            if let Some(uart_baud) = info.uart_baud {
-                store_node.uart_baud = Some(uart_baud);
-                new_bauds.push((node, uart_baud));
-            }
-        }
+        let new_bauds = apply_node_updates(&mut stored_nodes, new_info);
 
         self.app_db
             .set::<NodeInfos>(NODE_INFO_KEY, stored_nodes)
@@ -677,19 +710,88 @@ impl BmcApplication {
 mod tests {
     use super::*;
 
-    fn request(entries: &[(NodeId, Option<u32>)]) -> HashMap<NodeId, NodeInfo> {
+    fn request(entries: &[(NodeId, Option<u32>)]) -> HashMap<NodeId, NodeInfoUpdate> {
         entries
             .iter()
             .map(|(node, uart_baud)| {
                 (
                     *node,
-                    NodeInfo {
-                        uart_baud: *uart_baud,
+                    NodeInfoUpdate {
+                        uart_baud: Some(*uart_baud),
                         ..Default::default()
                     },
                 )
             })
             .collect()
+    }
+
+    fn parse(json: serde_json::Value) -> HashMap<NodeId, NodeInfoUpdate> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_request_tells_a_speed_from_null_from_nothing() {
+        let infos = parse(serde_json::json!({
+            "Node1": { "name": "only a name" },
+            "Node2": { "uart_baud": 1500000 },
+            "Node3": { "uart_baud": null },
+        }));
+        assert_eq!(infos[&NodeId::Node1].uart_baud, None);
+        assert_eq!(infos[&NodeId::Node2].uart_baud, Some(Some(1_500_000)));
+        assert_eq!(infos[&NodeId::Node3].uart_baud, Some(None));
+    }
+
+    #[test]
+    fn null_clears_the_stored_speed_and_returns_the_port_to_the_default() {
+        let mut stored = NodeInfos::default();
+        stored[1].uart_baud = Some(1_500_000);
+        stored[2].uart_baud = Some(9_600);
+
+        let moved = apply_node_updates(
+            &mut stored,
+            parse(serde_json::json!({ "Node2": { "uart_baud": null } })),
+        );
+
+        assert_eq!(stored[1].uart_baud, None);
+        assert_eq!(moved, vec![(NodeId::Node2, 115_200)]);
+        // The node that was not in the request keeps its speed.
+        assert_eq!(stored[2].uart_baud, Some(9_600));
+    }
+
+    #[test]
+    fn a_request_that_leaves_the_speed_out_keeps_it() {
+        let mut stored = NodeInfos::default();
+        stored[0].uart_baud = Some(57_600);
+
+        let moved = apply_node_updates(
+            &mut stored,
+            parse(serde_json::json!({ "Node1": { "name": "renamed" } })),
+        );
+
+        assert_eq!(stored[0].uart_baud, Some(57_600));
+        assert_eq!(stored[0].name.as_deref(), Some("renamed"));
+        assert!(moved.is_empty());
+    }
+
+    #[test]
+    fn a_speed_is_stored_and_applied() {
+        let mut stored = NodeInfos::default();
+        let moved = apply_node_updates(
+            &mut stored,
+            parse(serde_json::json!({ "Node4": { "uart_baud": 921600 } })),
+        );
+        assert_eq!(stored[3].uart_baud, Some(921_600));
+        assert_eq!(moved, vec![(NodeId::Node4, 921_600)]);
+    }
+
+    #[test]
+    fn null_is_accepted_by_the_validation() {
+        assert_eq!(
+            validate_node_infos(&parse(
+                serde_json::json!({ "Node1": { "uart_baud": null } })
+            )),
+            Ok(())
+        );
     }
 
     #[test]

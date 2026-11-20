@@ -45,6 +45,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `self` entry (a bridge that never had it) no longer stops the plan.
   (thanks @danste22, #49 and #52)
 
+- **`{"NodeN":{"uart_baud":null}}` answered 200 and changed nothing.** The
+  serial speed of a node starts as `null` (the default, 115200), but there was
+  no way back to it: a request could not tell `null` from a field left out, and
+  both kept the stored speed. Now `null` clears the stored speed and the open
+  port goes back to 115200 at once, without disconnecting the web console; a
+  field left out of a request still keeps what is stored. A configuration
+  import behaves as before: a file with no speed for a node leaves it alone.
+
 ## [2.43.0] — 2026-11-14
 
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.

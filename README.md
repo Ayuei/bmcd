@@ -127,7 +127,8 @@ meaning "use `/dev/ttyNodeN`".
   node's settings: 115200 when unset, applied at start and as soon as it is
   changed, without disconnecting the web console.
   `POST /api/bmc?opt=set&type=node_info` with `{"Node2": {"uart_baud": 1500000}}`
-  sets it; `GET /api/bmc/nodes` (or `opt=get&type=node_info`) shows it. The
+  sets it, and `{"Node2": {"uart_baud": null}}` clears it again (115200);
+  `GET /api/bmc/nodes` (or `opt=get&type=node_info`) shows it. The
   rates are the standard Linux ones from 300 up to 3000000; anything else is a
   `400` naming the node and listing them.
 * **Nobody has to be reading.** The daemon never waits for a tool: output that
