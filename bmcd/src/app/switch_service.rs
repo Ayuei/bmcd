@@ -1478,10 +1478,12 @@ mod tests {
     async fn a_failed_interfaces_write_leaves_the_change_pending() {
         let dir = tempdir::TempDir::new("switch-confirm-fail").expect("temp dir");
         let switch_path = dir.path().join("switch.json");
-        // Long enough that the copy fits in 255 bytes but the temp file of
-        // the write does not, so the write fails even for root.
-        let interfaces = dir.path().join("i".repeat(230));
+        let interfaces = dir.path().join("interfaces");
         std::fs::write(&interfaces, HAND_FILE).unwrap();
+        // The write's temp file is `<name>.tmp`. A directory of that name
+        // cannot be removed as a stale file, so the write fails, for root too,
+        // after the copy of the hand file has been made.
+        std::fs::create_dir(dir.path().join("interfaces.tmp")).unwrap();
         let service = SwitchService::load(&switch_path)
             .with_interfaces_path(&interfaces)
             .with_bond_executors(executor(dir.path()));
