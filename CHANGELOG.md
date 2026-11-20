@@ -10,6 +10,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reboot of the BMC on the 6.18 kernel no longer reads as a cold boot.**
+  The daemon logged `cold boot: restoring persisted power state` on every
+  start, with all four modules powered and running, where on the 6.12 kernel it
+  logged `adopted live power state`. The state was restored from the database
+  instead of adopted, so a node that was off in the database but on in fact was
+  switched off. Two causes. The node enable lines were requested as outputs
+  with no value, which drives them to 0; the 6.18 gpio-latch driver writes that
+  into the latch and its shadow, so the read that followed saw "all off" (the
+  6.12 driver ignored the request). And the enable lines alone cannot tell a
+  running board from a cold one: they are active low, and the bootloader clears
+  every latch on a cold boot, which reads as "enabled". The daemon now reads the
+  boot cookie and the latch shadow word that the bootloader and the kernel keep
+  in SoC SRAM (read-only, through `/dev/mem`, no line is touched) and counts a
+  node as powered when the ATX latch is set and its enable latch is asserted.
+  A cold boot clears the ATX latch, so it still restores the persisted state.
+  The enable lines are requested with what the board is doing, so starting the
+  daemon no longer holds running modules in reset for a moment. Where the shadow
+  cannot be read, and on a v2.4 board, the daemon reads the enable lines as
+  before.
+
 ## [2.45.0] — 2026-11-20
 
 Adds LACP to the switch: the two uplink ports can now be one 802.3ad bond.
