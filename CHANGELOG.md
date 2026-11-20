@@ -10,6 +10,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.44.0] — 2026-11-20
+
+Answers <https://github.com/excavador-turing/BMC-Firmware/issues/81> and
+<https://github.com/excavador-turing/BMC-Firmware/issues/82>, and takes the
+serial speed back to its default.
+
+Thanks to the people outside the project who made this release:
+[@cloudlabworks](https://github.com/cloudlabworks) for
+[#39](https://github.com/excavador-turing/bmcd/pull/39) and
+[#40](https://github.com/excavador-turing/bmcd/pull/40), and
+[@danste22](https://github.com/danste22) for
+[#48](https://github.com/excavador-turing/bmcd/pull/48) (carried on as
+[#51](https://github.com/excavador-turing/bmcd/pull/51)) and
+[#49](https://github.com/excavador-turing/bmcd/pull/49) (carried on as
+[#52](https://github.com/excavador-turing/bmcd/pull/52)). Their original
+commits are in those pull requests.
+
+### Changed
+
+- **The toolchain named in the Justfile and the README is 1.98.1.** Both still
+  said 1.85, which CI left behind long ago; `rust-toolchain.toml` has pinned
+  1.98.1, the version the firmware builds with. Documentation only.
+  (thanks [@cloudlabworks](https://github.com/cloudlabworks), #40; the README
+  in #53)
+
 ### Fixed
 
 - **A session token the daemon had forgotten counted as a wrong password.**
@@ -22,7 +47,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   token is still refused with the same 401 and `Bearer` challenge, but no
   longer counts. A 64-character random token cannot be guessed, so counting
   it gave no protection. A ban that already stands still refuses tokens.
-  (thanks @cloudlabworks, #39)
+  (thanks [@cloudlabworks](https://github.com/cloudlabworks), [#39](https://github.com/excavador-turing/bmcd/pull/39))
 
 - **Confirmed config files are flushed to flash before rename.**
   `switch.json`, `/etc/network/interfaces`, access overrides, the managed
@@ -33,7 +58,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `write_durably`, now syncs the data and the directory (one `<name>.tmp`
   per target, opened exclusively, a stale one from an interrupted write
   removed first; a directory sync failure after rename is logged, not
-  treated as a failed write). (thanks @danste22, #48 and #51)
+  treated as a failed write). (thanks [@danste22](https://github.com/danste22), [#48](https://github.com/excavador-turing/bmcd/pull/48) → [#51](https://github.com/excavador-turing/bmcd/pull/51); fixes BMC-Firmware#81)
 
 - **Split and Trunk left the BMC on VLAN 1.** `plan()` skipped `PortId::Bmc`
   because it has no netdev. The BMC's membership is the bridge `self` entry
@@ -43,7 +68,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   planner now emits those `self` lines, the BMC's new VLAN added BEFORE the
   old one is deleted so the BMC is never in none, and a failed delete of a
   `self` entry (a bridge that never had it) no longer stops the plan.
-  (thanks @danste22, #49 and #52)
+  (thanks [@danste22](https://github.com/danste22), [#49](https://github.com/excavador-turing/bmcd/pull/49) → [#52](https://github.com/excavador-turing/bmcd/pull/52); fixes BMC-Firmware#82)
 
 - **`{"NodeN":{"uart_baud":null}}` answered 200 and changed nothing.** The
   serial speed of a node starts as `null` (the default, 115200), but there was
