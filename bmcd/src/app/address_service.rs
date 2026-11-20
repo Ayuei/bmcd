@@ -321,8 +321,9 @@ impl AddressService {
                     inner.stamp = modified(&self.path);
                     done.file_rewritten = true;
                     tracing::warn!(
-                        "rewrote {}: it was written by an earlier version of this daemon \
-                         and its boot hook could not have run",
+                        "rewrote {}: an earlier version of this daemon wrote it as the address \
+                         alone, without the switch's own boot lines (bond0, VLANs); it now \
+                         carries both",
                         self.path.display()
                     );
                 }

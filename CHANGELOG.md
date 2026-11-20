@@ -10,6 +10,105 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Thanks to [@danste22](https://github.com/danste22) for LACP, in
+[#50](https://github.com/excavador-turing/bmcd/pull/50), carried on as
+[#56](https://github.com/excavador-turing/bmcd/pull/56). His original commits
+are kept in this branch, with their author.
+
+### Added
+
+- **LACP (`SecondUplink::Lag`) on Flat and Trunk.** `bond0` (802.3ad) carries
+  the uplink VLANs; ge0 and ge1 are empty slaves. The presets list shows them
+  as `flat-lag` and `trunk-lag`; the value to send is the preset's `preset`
+  field, for example `{"preset":"flat","second_uplink":"lag"}`. Split stays
+  incompatible with LAG. The bond is created with `xmit_hash_policy layer2+3`
+  and `lacp_rate fast`, live and in the `interfaces` stanza: the switch copies
+  the bond's hash when it joins, and the kernel default `layer2` put two
+  nodes' uploads on one member. With DHCP, `br0` gets
+  `udhcpc-opts "-t 25 -T 2"` so the lease waits for LACP to reach
+  Distributing. The confirm window watches `bond0`. LACP needs ifupdown-ng's
+  bond executor on the image. (thanks @danste22, #50)
+
+- **A confirmed switch change also writes `/etc/network/interfaces`.** One
+  locked writer, shared with address confirm. A `# bmcd-switch:` header carries
+  the document, and `bond0`, `bridge-ports` and the `post-up` lines come from
+  it, so a reboot brings the bond and the VLANs up before this daemon starts.
+  (thanks @danste22, #50)
+
+- **A document without `second_uplink` is read one way, whatever it came in
+  by.** The file on the overlay, the `interfaces` header and an API body all
+  infer it from the ports and STP (a Split, or a Trunk with ge1 off, is
+  `off`; STP on is `redundant`; `bond0` in the ports is `lag`), instead of the
+  API defaulting to `redundant` while the file inferred.
+
+### Changed
+
+- **Upgrading rewrites an address-only `interfaces` once.** A board whose
+  `interfaces` was written by an earlier bmcd as the address alone has it
+  rewritten at the first start of this version, now carrying the switch's own
+  boot lines (and `bond0` when LACP is confirmed). The log line says so. A
+  file written by hand is never rewritten by this.
+
+- **A hand-written `interfaces` holds up LACP only.** LACP is the one change
+  that needs the file (`bond0` has to exist before this daemon starts), so
+  only an apply that asks for `second_uplink: lag` over a hand-written file is
+  refused, with a 409, unless the request carries `replace_hand_written: true`
+  (a copy of the file is kept when the change is confirmed). Every other
+  change is applied live and persisted in `switch.json` as before, and a
+  hand-written file is left alone, at confirm and at boot. A hand-written file
+  whose address cannot be read (not DHCP, not a static address with a netmask)
+  is refused instead of turned into DHCP. The 409 names the options a client
+  has: the interface's checkbox, `tpi --replace-hand-written`, or the field in
+  the request; the clients grow them separately.
+
+- **The OpenAPI request bodies of `PUT` and `validate` on the switch are the
+  `SwitchPreset` and `SwitchDocument` components,** with `window_s` and
+  `replace_hand_written` beside them, instead of a hand-written `properties`
+  list that had already drifted from them.
+
+### Fixed
+
+- **A confirm window that never starts is no longer a trap.** The window
+  starts when the uplink forwards. With LACP that is easy to miss (an uncabled
+  port, a switch with no LACP on the other end, a bond that never
+  negotiates), and the board was then off the network with nothing to put it
+  back until a power cycle. A change whose uplink has not forwarded within
+  `window_s` plus 60 seconds of the apply is now put back anyway. (review of
+  #50)
+
+- **A failed LACP apply no longer takes down a bond it did not make.** A
+  `bond0` that already exists and is not the running document's (a
+  hand-written file, an earlier run) refuses the apply with a 409 and changes
+  nothing. A failed apply undoes only what it did: the bond is deleted only if
+  this apply created it. (review of #50)
+
+- **Boot heal checks the kernel, not just the file.** When `interfaces`
+  matches the confirmed document, heal now also checks that `bond0` exists for
+  LACP, that `br0` has `vlan_filtering` as the document says, and that each
+  front port holds its VLANs, and runs the `post-up` plan once if they are
+  missing. A `br0` whose DHCP failed before `post-up` ran no longer leaves
+  bmcd believing in VLANs that were never programmed. A hand-written
+  `interfaces` is still left alone, and a `bond0` it made is not made again.
+  (review of #50)
+
+- **A revert does not stop at the first error, and reports what is there.**
+  The timer and a requested revert now try every step even if one fails (a
+  half-moved ge0 and ge1 left the board stranded), and the document reported
+  as running is then read back from the kernel instead of assumed.
+  (review of #50)
+
+- **`post-up` lines that delete the bridge's own VLAN end in `|| true`.**
+  `ifupdown` stops at a `post-up` that fails, and the delete of an entry that
+  may not exist must not cancel the lines after it.
+
+- **Confirm reads the clock once.** The check and the commit used two
+  readings; if the window ended while the two files were being flushed, the
+  commit refused after both were written, and the timer then put the old
+  document back under a configuration nobody confirmed. (review of #50)
+
+- **The preview warnings for a LACP document ask about `bond0`,** not about
+  ge0 and ge1, which are empty slaves by design.
+
 ## [2.44.0] — 2026-11-20
 
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/81> and
@@ -77,28 +176,6 @@ commits are in those pull requests.
   port goes back to 115200 at once, without disconnecting the web console; a
   field left out of a request still keeps what is stored. A configuration
   import behaves as before: a file with no speed for a node leaves it alone.
-
-### Added
-
-- **LACP (`SecondUplink::Lag`) on Flat and Trunk.** `bond0` (802.3ad) carries
-  the uplink VLANs; ge0/ge1 are empty slaves. The presets list shows them as
-  `flat-lag` / `trunk-lag`; the value to send is the preset's `preset` field,
-  e.g. `{"preset":"flat","second_uplink":"lag"}`. Confirm requires ifupdown-ng's bond executor. The confirm
-  window watches `bond0`. A failed apply runs a best-effort inverse plan.
-  Split remains incompatible with LAG. Older `switch.json` files without
-  `second_uplink` infer Off/Redundant/Lag from ports and STP. The bond is
-  created with `xmit_hash_policy layer2+3` and `lacp_rate fast`, live and in
-  the `interfaces` stanza: the switch copies the bond's hash when it joins,
-  and the kernel default `layer2` put two nodes' uploads on one member. With
-  DHCP, `br0` gets `udhcpc-opts "-t 25 -T 2"` so the lease waits for LACP.
-
-- **Switch confirm dual-writes `/etc/network/interfaces`.** One locked writer
-  shared with address confirm. A `# bmcd-switch:` header carries the
-  document; bond0 / `bridge-ports` / `post-up` hooks come from
-  `plan(flat-with-same-uplink, confirmed)`. Boot heal skips when the file
-  matches; otherwise rewrites (never a hand-written file without
-  `replace_hand_written`) and plans from the header or image Flat. Safe mode
-  skips heal.
 
 ## [2.43.0] — 2026-11-14
 

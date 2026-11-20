@@ -182,7 +182,11 @@ impl PortConfig {
 }
 
 /// The whole switch, as one object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// Deserialised by hand, below, so that a missing `second_uplink` means the
+/// same thing wherever the document comes from: see [`SwitchDocument`]'s
+/// `Deserialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SwitchDocument {
     /// False is `Flat`: the switch forwards without looking at VLANs and the
     /// port table below is inert. Kept in the document rather than implied by
@@ -192,11 +196,11 @@ pub struct SwitchDocument {
     pub stp: bool,
     /// How ge0/ge1 relate: STP redundancy, second cable off, or LACP bond0.
     ///
-    /// Older files omit the field. [`SwitchDocument::from_json_slice`] infers
-    /// it from ports and STP rather than defaulting everything to Redundant —
-    /// a persisted Split or Trunk-with-ge1-off would otherwise disagree with
-    /// its own preset. Direct serde still defaults to Redundant for API
-    /// bodies that omit it on a fresh document.
+    /// Older files and older clients omit the field. Reading a document
+    /// without it infers it from the ports and STP rather than defaulting
+    /// everything to Redundant — a Split or a Trunk with ge1 off would
+    /// otherwise disagree with its own preset. One rule for every way in: the
+    /// file, the `interfaces` header and an API body all read it the same.
     #[serde(default)]
     pub second_uplink: SecondUplink,
     pub ports: BTreeMap<PortId, PortConfig>,
@@ -223,6 +227,38 @@ pub struct SwitchDocument {
     /// the keys here works the same by either path.
     #[serde(default, deserialize_with = "names_from_wire")]
     pub names: BTreeMap<u16, String>,
+}
+
+impl<'de> Deserialize<'de> for SwitchDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The document as it is on the wire, where `second_uplink` may be
+        /// missing.
+        #[derive(Deserialize)]
+        struct Wire {
+            vlan_filtering: bool,
+            stp: bool,
+            #[serde(default)]
+            second_uplink: Option<SecondUplink>,
+            ports: BTreeMap<PortId, PortConfig>,
+            #[serde(default, deserialize_with = "names_from_wire")]
+            names: BTreeMap<u16, String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut document = SwitchDocument {
+            vlan_filtering: wire.vlan_filtering,
+            stp: wire.stp,
+            second_uplink: SecondUplink::Redundant,
+            ports: wire.ports,
+            names: wire.names,
+        };
+        document.second_uplink = wire
+            .second_uplink
+            .unwrap_or_else(|| infer_second_uplink(&document));
+        Ok(document)
+    }
 }
 
 /// `names` as it is on the wire: an object whose keys are VLAN ids written as
@@ -398,7 +434,7 @@ impl Preset {
 }
 
 /// Recover `second_uplink` for files written before the field existed.
-fn infer_second_uplink(document: &SwitchDocument) -> SecondUplink {
+pub(crate) fn infer_second_uplink(document: &SwitchDocument) -> SecondUplink {
     if document.ports.contains_key(&PortId::Bond0) {
         SecondUplink::Lag
     } else if document.stp {
@@ -434,28 +470,16 @@ pub struct Warning {
 }
 
 impl SwitchDocument {
-    /// Load a persisted document, inferring `second_uplink` when the field is
-    /// absent so pre-LAG files keep matching their presets.
+    /// Load a persisted document. `second_uplink` is inferred when the field
+    /// is absent, so pre-LAG files keep matching their presets: the same rule
+    /// as for an API body, because both go through the one `Deserialize`.
     pub fn from_json_slice(bytes: &[u8]) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-        Self::from_json_value(value)
+        serde_json::from_slice(bytes).ok()
     }
 
-    /// Same as [`from_json_slice`] for a header line.
+    /// Same as [`from_json_slice`](Self::from_json_slice) for a header line.
     pub fn from_json_str(text: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
-        Self::from_json_value(value)
-    }
-
-    fn from_json_value(value: serde_json::Value) -> Option<Self> {
-        let had_second_uplink = value
-            .as_object()
-            .is_some_and(|obj| obj.contains_key("second_uplink"));
-        let mut document: SwitchDocument = serde_json::from_value(value).ok()?;
-        if !had_second_uplink {
-            document.second_uplink = infer_second_uplink(&document);
-        }
-        Some(document)
+        serde_json::from_str(text).ok()
     }
 
     /// Which ports are in `vid`, tagged or untagged.
@@ -632,7 +656,15 @@ impl SwitchDocument {
             return warnings;
         }
 
-        for port in PortId::ALL {
+        let lag = self.second_uplink == SecondUplink::Lag;
+        // With LACP, ge0 and ge1 are bond slaves: empty on purpose, and not
+        // bridge ports at all. The bond is the uplink, so it is the one asked
+        // about instead.
+        let ports = PortId::ALL
+            .into_iter()
+            .filter(|port| !(lag && matches!(port, PortId::Ge0 | PortId::Ge1)))
+            .chain(lag.then_some(PortId::Bond0));
+        for port in ports {
             let config = self.ports.get(&port).cloned().unwrap_or_default();
             if config.vlans().is_empty() {
                 warnings.push(Warning {
@@ -1043,6 +1075,83 @@ mod tests {
         let json = r#"{"vlan_filtering":false,"stp":false,"ports":{}}"#;
         let d: SwitchDocument = serde_json::from_str(json).expect("names is optional");
         assert!(d.names.is_empty());
+    }
+
+    /// One rule for a missing `second_uplink`, whichever way the document
+    /// comes in: a file on the overlay, the header of `interfaces`, or an API
+    /// body (which reaches serde through the buffering `untagged` Proposal
+    /// enum). Each of the shapes a board is actually in.
+    #[test]
+    fn a_document_without_second_uplink_reads_the_same_from_a_file_and_an_api_body() {
+        let shapes = [
+            Preset::flat(),
+            Preset::Flat {
+                second_uplink: SecondUplink::Lag,
+            },
+            Preset::Split,
+            trunk(),
+            Preset::Trunk {
+                management_vid: 10,
+                node_vid: 20,
+                second_uplink: SecondUplink::Off,
+            },
+            Preset::Trunk {
+                management_vid: 10,
+                node_vid: 20,
+                second_uplink: SecondUplink::Lag,
+            },
+        ];
+        for preset in shapes {
+            let document = preset.expand();
+            let mut value = serde_json::to_value(&document).unwrap();
+            value.as_object_mut().unwrap().remove("second_uplink");
+            let text = serde_json::to_string(&value).unwrap();
+
+            let from_file = SwitchDocument::from_json_slice(text.as_bytes()).expect("file");
+            let from_header = SwitchDocument::from_json_str(&text).expect("header");
+            let from_body: SwitchDocument = serde_json::from_str(&text).expect("body");
+            assert_eq!(from_file, from_body, "{preset:?}");
+            assert_eq!(from_header, from_body, "{preset:?}");
+            // And it is the document the preset meant: the field was not
+            // needed to know what it is.
+            assert_eq!(from_body, document, "{preset:?}");
+        }
+    }
+
+    /// A field that is there wins over any inference.
+    #[test]
+    fn a_second_uplink_that_is_given_is_not_inferred_over() {
+        let mut value = serde_json::to_value(trunk().expand()).unwrap();
+        value["second_uplink"] = serde_json::json!("off");
+        let d: SwitchDocument = serde_json::from_value(value).unwrap();
+        assert_eq!(d.second_uplink, SecondUplink::Off);
+    }
+
+    /// The warnings for a LAG document talk about bond0, not about the two
+    /// slaves that are empty by design.
+    #[test]
+    fn lag_warnings_skip_the_slaves_and_ask_about_the_bond() {
+        let d = Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let warned: Vec<Option<PortId>> = d.warnings().iter().map(|w| w.port).collect();
+        assert!(!warned.contains(&Some(PortId::Ge0)), "{warned:?}");
+        assert!(!warned.contains(&Some(PortId::Ge1)), "{warned:?}");
+
+        // With nothing on bond0 the bond is what is flagged.
+        let mut empty = d.clone();
+        empty.ports.insert(PortId::Bond0, PortConfig::none());
+        let warned: Vec<Option<PortId>> = empty.warnings().iter().map(|w| w.port).collect();
+        assert!(warned.contains(&Some(PortId::Bond0)), "{warned:?}");
+
+        // A document that is not LAG still warns about an empty ge0.
+        let mut plain = trunk().expand();
+        plain.ports.insert(PortId::Ge0, PortConfig::none());
+        let warned: Vec<Option<PortId>> = plain.warnings().iter().map(|w| w.port).collect();
+        assert!(warned.contains(&Some(PortId::Ge0)), "{warned:?}");
     }
 
     #[test]

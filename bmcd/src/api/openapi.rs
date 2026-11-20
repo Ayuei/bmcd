@@ -156,6 +156,48 @@ fn one_of_array(name: &str) -> Value {
 /// deliberate act with a reason attached; leaving one out fails the build.
 const UNTYPED: &[&str] = &[];
 
+/// What `PUT` and `validate` on the switch take: a preset or a whole document,
+/// and for `PUT` the two options beside it.
+///
+/// Built from the same `SwitchPreset` and `SwitchDocument` components the
+/// responses use, so the request and the answers cannot drift apart the way a
+/// hand-written `properties` list did.
+fn switch_proposal_schema(with_options: bool) -> Value {
+    let proposal = json!({
+        "oneOf": [component_ref("SwitchPreset"), component_ref("SwitchDocument")]
+    });
+    if !with_options {
+        return json!({
+            "description": "A preset (`{\"preset\": \"flat\"|\"split\"|\"trunk\", ...}`) or a \
+                            whole document.",
+            "allOf": [proposal]
+        });
+    }
+    json!({
+        "description": "A preset or a SwitchDocument, plus optional window_s and \
+                        replace_hand_written.",
+        "allOf": [
+            proposal,
+            {
+                "type": "object",
+                "properties": {
+                    "window_s": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Seconds to wait for a confirmation; the board's \
+                                        default when absent."
+                    },
+                    "replace_hand_written": {
+                        "type": "boolean",
+                        "description": "Say yes to replacing a hand-written \
+                                        /etc/network/interfaces. Needed for LACP only."
+                    }
+                }
+            }
+        ]
+    })
+}
+
 fn component_ref(name: &str) -> Value {
     json!({ "$ref": format!("#/components/schemas/{}", name) })
 }
@@ -427,8 +469,10 @@ fn access_paths() -> Vec<(String, Value)> {
                     "description": "Takes a preset (`flat`, `split` or `trunk`; `flat` and \
                                     `trunk` take an optional `second_uplink`, and \
                                     `second_uplink: lag` is LACP on `bond0`) or a whole document \
-                                    with optional `second_uplink` (`redundant` | `off` | `lag`) \
-                                    and `bond0` when LACP is on, plus optional `window_s` and \
+                                    (`SwitchDocument`, with `second_uplink` of `redundant`, `off` \
+                                    or `lag`, and `bond0` in its ports when LACP is on; a \
+                                    document without `second_uplink` has it inferred from its \
+                                    ports and STP), plus an optional `window_s` and \
                                     `replace_hand_written`. Answers **202**, not 200: the change \
                                     is on the switch but it is not yours to keep yet. Confirm \
                                     within the window or the board puts the previous \
@@ -436,22 +480,24 @@ fn access_paths() -> Vec<(String, Value)> {
                                     counting until the uplink carrying the BMC's VLAN reports \
                                     forwarding, because spanning tree holds a port for its own \
                                     forwarding delay first -- counting from the apply would \
-                                    revert every correct change.",
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
-                        "type": "object",
-                        "description": "A preset or SwitchDocument, plus optional window_s and \
-                                        replace_hand_written.",
-                        "properties": {
-                            "window_s": { "type": "integer" },
-                            "replace_hand_written": { "type": "boolean" },
-                            "preset": { "type": "string", "enum": ["flat", "split", "trunk"] },
-                            "second_uplink": { "type": "string", "enum": ["redundant", "off", "lag"] }
-                        }
-                    })}}},
+                                    revert every correct change. If the uplink has not \
+                                    forwarded by `window_s` plus 60 seconds after the apply, the \
+                                    change is put back anyway: an uplink that never comes up \
+                                    must not leave the board stranded. \
+                                    `replace_hand_written` matters for LACP only: LACP needs \
+                                    `bond0` declared in `/etc/network/interfaces`, so a hand-written \
+                                    file is refused with a **409** unless it is sent as true, and \
+                                    a copy of the file is kept when the change is confirmed. \
+                                    Every other change leaves a hand-written file alone.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": switch_proposal_schema(true) }}},
                     "responses": {
                         "202": { "description": "Applied, and waiting: token, applied_at, window_s." },
-                        "409": { "description": "No br0, or /etc/network/interfaces is hand-written \
-                                                 and replace_hand_written was not set.",
+                        "409": { "description": "No br0; or LACP was asked for while \
+                                                 /etc/network/interfaces is hand-written and \
+                                                 replace_hand_written was not set (the message \
+                                                 names the options clients have for it); or \
+                                                 bond0 already exists and this daemon did not \
+                                                 create it. Nothing was changed.",
                                  "content": { "application/json": { "schema": legacy_error.clone() } } },
                         "default": problem
                     }
@@ -535,10 +581,7 @@ fn access_paths() -> Vec<(String, Value)> {
                                     warnings. Changes nothing. A refusal comes back inside a 200: \
                                     the caller asked a question and got an answer, and did not \
                                     make a bad request.",
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": json!({
-                        "description": "Either {\"preset\": \"flat\"|\"split\"|\"trunk\", ...} or a full document.",
-                        "type": "object"
-                    })}}},
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": switch_proposal_schema(false) }}},
                     "responses": {
                         "200": { "description": "The verdict: document, refusal, warnings." },
                         "409": { "description": "The board has no br0, the bridge over the switch ports, so there is nothing to validate against.",
@@ -1350,6 +1393,63 @@ mod tests {
                 "$ref names a component that does not exist: {reference}"
             );
         }
+    }
+
+    /// The request bodies the switch endpoints document are the ones the
+    /// daemon reads: a preset, a preset with `second_uplink`, a whole document
+    /// (with and without `second_uplink`), each with the apply options. And
+    /// one that is neither is not accepted.
+    #[test]
+    fn the_switch_request_bodies_match_what_the_daemon_reads() {
+        use crate::app::switch_document::{Preset, SecondUplink};
+        let doc = document();
+        let schema_of = |path: &str, method: &str| -> jsonschema::Validator {
+            let schema = doc["paths"][path][method]["requestBody"]["content"]["application/json"]
+                ["schema"]
+                .clone();
+            let mut root = schema;
+            root["components"] = doc["components"].clone();
+            jsonschema::validator_for(&root).expect("a valid request schema")
+        };
+        let apply = schema_of("/api/bmc/network/switch", "put");
+        let validate = schema_of("/api/bmc/network/switch/validate", "post");
+
+        let lag_trunk = Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        };
+        let mut bodies = vec![
+            json!({"preset": "flat"}),
+            json!({"preset": "flat", "second_uplink": "lag"}),
+            json!({"preset": "split"}),
+            serde_json::to_value(lag_trunk).unwrap(),
+            serde_json::to_value(Preset::flat().expand()).unwrap(),
+            serde_json::to_value(lag_trunk.expand()).unwrap(),
+        ];
+        // A document from a client that predates `second_uplink`.
+        let mut old = serde_json::to_value(Preset::Split.expand()).unwrap();
+        old.as_object_mut().unwrap().remove("second_uplink");
+        bodies.push(old);
+
+        for body in &bodies {
+            assert!(validate.is_valid(body), "validate: {body}");
+            let mut with_options = body.clone();
+            with_options["window_s"] = json!(60);
+            with_options["replace_hand_written"] = json!(true);
+            assert!(apply.is_valid(&with_options), "apply: {with_options}");
+            // The daemon reads the same bodies.
+            let read: Result<crate::api::network::Proposal, _> =
+                serde_json::from_value(body.clone());
+            assert!(read.is_ok(), "the daemon cannot read {body}");
+            let read: Result<crate::api::network::ApplyRequest, _> =
+                serde_json::from_value(with_options.clone());
+            assert!(read.is_ok(), "the daemon cannot read {with_options}");
+        }
+
+        assert!(!apply.is_valid(&json!({"preset": "nonsense"})));
+        assert!(!apply.is_valid(&json!({"replace_hand_written": true})));
+        assert!(!apply.is_valid(&json!({"preset": "flat", "replace_hand_written": "yes"})));
     }
 
     fn collect_refs(node: &Value, out: &mut Vec<String>) {

@@ -35,7 +35,10 @@
 //! the network in the middle of its own reconfiguration -- which the confirm
 //! window would recover, but only after making an operator watch it happen.
 
-use crate::app::switch_document::{PortConfig, PortId, SecondUplink, SwitchDocument};
+use crate::app::switch_document::{
+    infer_second_uplink, PortConfig, PortId, SecondUplink, SwitchDocument,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The kernel's name for each front-panel / node port, as the device tree
 /// spells it.
@@ -329,7 +332,7 @@ fn effective_was(
     }
 }
 
-fn setup_lag() -> Vec<Command> {
+pub fn setup_lag() -> Vec<Command> {
     vec![
         cmd(&[
             "ip",
@@ -360,7 +363,7 @@ fn setup_lag() -> Vec<Command> {
     ]
 }
 
-fn teardown_lag() -> Vec<Command> {
+pub fn teardown_lag() -> Vec<Command> {
     vec![
         cmd(&["ip", "link", "set", "dev", BOND, "nomaster"]),
         cmd(&["ip", "link", "set", "dev", "ge0", "nomaster"]),
@@ -372,6 +375,222 @@ fn teardown_lag() -> Vec<Command> {
         cmd(&["ip", "link", "set", "dev", "ge0", "up"]),
         cmd(&["ip", "link", "set", "dev", "ge1", "up"]),
     ]
+}
+
+/// True for the command that creates `bond0`.
+pub fn creates_bond(command: &Command) -> bool {
+    matches!(
+        command
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["ip", "link", "add", BOND, ..]
+    )
+}
+
+/// The commands that undo a plan that stopped part-way, as far as it got.
+///
+/// `previous` is what the switch was running, `document` what the failed plan
+/// was moving it to. `bond_created` is whether the plan got as far as creating
+/// `bond0` itself.
+///
+/// Going back is usually `plan(document, previous)`. The exception is a move
+/// *into* LACP that failed before it created the bond: the inverse plan would
+/// then run [`teardown_lag`], which deletes `bond0` and puts ge0/ge1 straight
+/// on the bridge. A `bond0` this plan did not create is somebody else's (a
+/// hand-written file, an earlier run), and that is a bond it must not take
+/// down. So in that case only what the plan can actually have done is undone:
+/// the VLANs it removed, written back from `previous`, and filtering and
+/// spanning tree returned to what they were.
+pub fn undo_plan(
+    previous: &SwitchDocument,
+    document: &SwitchDocument,
+    bond_created: bool,
+) -> Vec<Command> {
+    let into_lag =
+        document.second_uplink == SecondUplink::Lag && previous.second_uplink != SecondUplink::Lag;
+    if !into_lag || bond_created {
+        return plan(document, previous);
+    }
+    // What the kernel can hold at that point: no bond, no VLANs written yet
+    // that `previous` did not already have. Planning from an empty table to
+    // `previous` writes every membership back, which `bridge vlan add` takes
+    // as a no-op where it is already right.
+    let partial = SwitchDocument {
+        vlan_filtering: document.vlan_filtering,
+        stp: document.stp,
+        second_uplink: previous.second_uplink,
+        ports: BTreeMap::new(),
+        names: BTreeMap::new(),
+    };
+    plan(&partial, previous)
+}
+
+/// `bridge -j vlan show`: every VLAN on every bridge port, as JSON.
+pub const SHOW_VLANS: [&str; 4] = ["bridge", "-j", "vlan", "show"];
+
+/// One VLAN on one port, as the kernel holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KernelVlan {
+    pub pvid: bool,
+    pub untagged: bool,
+}
+
+/// What the kernel says each port is in, by interface name.
+pub type KernelVlans = BTreeMap<String, BTreeMap<u16, KernelVlan>>;
+
+/// Read the output of [`SHOW_VLANS`]. `None` when it is not what `bridge -j`
+/// prints, which callers treat as "unknown", never as "empty".
+pub fn parse_bridge_vlans(json: &str) -> Option<KernelVlans> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut out = KernelVlans::new();
+    for entry in value.as_array()? {
+        let name = entry.get("ifname")?.as_str()?;
+        let port = out.entry(name.to_string()).or_default();
+        let vlans = entry
+            .get("vlans")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for vlan in vlans {
+            let first = u16::try_from(vlan.get("vlan")?.as_u64()?).ok()?;
+            let last = match vlan.get("vlanEnd").and_then(|v| v.as_u64()) {
+                Some(end) => u16::try_from(end).ok()?,
+                None => first,
+            };
+            let flags: Vec<&str> = vlan
+                .get("flags")
+                .and_then(|f| f.as_array())
+                .map(|f| f.iter().filter_map(|flag| flag.as_str()).collect())
+                .unwrap_or_default();
+            let info = KernelVlan {
+                pvid: flags.contains(&"PVID"),
+                untagged: flags.iter().any(|flag| flag.contains("Untagged")),
+            };
+            for vid in first..=last {
+                port.insert(vid, info);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The port a kernel interface name stands for.
+fn port_for_interface(name: &str) -> Option<PortId> {
+    if name == BRIDGE {
+        return Some(PortId::Bmc);
+    }
+    PortId::ALL
+        .into_iter()
+        .chain([PortId::Bond0])
+        .find(|port| interface_name(*port) == Some(name))
+}
+
+/// The ports with a netdev whose VLANs `document` expects the kernel to hold
+/// right now, and which VLANs. Empty when filtering is off, because the table
+/// is inert then. The BMC is left out: `bridge vlan show` does not reliably
+/// list the bridge's own entries, and the front ports are programmed by the
+/// same commands, so they say whether those ran.
+pub fn expected_vlans(document: &SwitchDocument) -> BTreeMap<&'static str, BTreeSet<u16>> {
+    let mut out = BTreeMap::new();
+    if !document.vlan_filtering {
+        return out;
+    }
+    for (port, config) in &document.ports {
+        if let Some(name) = interface_name(*port) {
+            // A slave of the bond is not a bridge port, so it holds nothing.
+            let bonded = document.second_uplink == SecondUplink::Lag
+                && matches!(port, PortId::Ge0 | PortId::Ge1);
+            if !bonded && !config.vlans().is_empty() {
+                out.insert(name, config.vlans());
+            }
+        }
+    }
+    out
+}
+
+/// What `bridge -j vlan show` prints for `document` once everything has been
+/// run: the front ports' VLANs, with the flags the kernel gives them. For
+/// tests, which have no kernel to ask.
+#[cfg(test)]
+pub(crate) fn show_vlans_json(document: &SwitchDocument) -> String {
+    let lag = document.second_uplink == SecondUplink::Lag;
+    let entries: Vec<serde_json::Value> = document
+        .ports
+        .iter()
+        .filter(|(port, _)| !(lag && matches!(port, PortId::Ge0 | PortId::Ge1)))
+        .filter_map(|(port, config)| {
+            let name = interface_name(*port).unwrap_or(BRIDGE);
+            let vlans: Vec<serde_json::Value> = config
+                .vlans()
+                .into_iter()
+                .map(|vid| {
+                    if config.untagged == Some(vid) {
+                        serde_json::json!({"vlan": vid, "flags": ["PVID", "Egress Untagged"]})
+                    } else {
+                        serde_json::json!({"vlan": vid})
+                    }
+                })
+                .collect();
+            (!vlans.is_empty()).then(|| serde_json::json!({"ifname": name, "vlans": vlans}))
+        })
+        .collect();
+    serde_json::Value::Array(entries).to_string()
+}
+
+/// The kernel's own account of the switch, as a document.
+///
+/// Used when a plan has failed part-way: what `intended` says is running is
+/// then a guess, and a guess is what the next plan would be computed from.
+/// VLANs come from `bridge vlan show`, filtering and spanning tree from the
+/// bridge, and the bond from whether `bond0` exists. The BMC's own entry and
+/// the VLAN names come from `fallback`, because the kernel does not report
+/// them reliably (the first) or at all (the second).
+pub fn document_from_kernel(
+    vlans: &KernelVlans,
+    filtering: bool,
+    stp: bool,
+    bond_present: bool,
+    fallback: &SwitchDocument,
+) -> SwitchDocument {
+    let mut ports: BTreeMap<PortId, PortConfig> = PortId::ALL
+        .into_iter()
+        .map(|port| (port, PortConfig::default()))
+        .collect();
+    if bond_present {
+        ports.insert(PortId::Bond0, PortConfig::default());
+    }
+    for (name, held) in vlans {
+        let Some(port) = port_for_interface(name) else {
+            continue;
+        };
+        if port == PortId::Bond0 && !bond_present {
+            continue;
+        }
+        let untagged = held
+            .iter()
+            .find(|(_, flags)| flags.pvid && flags.untagged)
+            .map(|(vid, _)| *vid);
+        let tagged = held
+            .keys()
+            .copied()
+            .filter(|vid| Some(*vid) != untagged)
+            .collect();
+        ports.insert(port, PortConfig { untagged, tagged });
+    }
+    if let Some(bmc) = fallback.ports.get(&PortId::Bmc) {
+        ports.insert(PortId::Bmc, bmc.clone());
+    }
+    let mut document = SwitchDocument {
+        vlan_filtering: filtering,
+        stp,
+        second_uplink: SecondUplink::Redundant,
+        ports,
+        names: fallback.names.clone(),
+    };
+    document.second_uplink = infer_second_uplink(&document);
+    document
 }
 
 #[cfg(test)]
@@ -700,5 +919,239 @@ mod tests {
             lines.iter().any(|l| l == "bridge vlan del dev ge1 vid 1"),
             "ge1 rejoins br0 with default_pvid 1: {lines:#?}"
         );
+    }
+
+    fn lag_flat() -> SwitchDocument {
+        Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand()
+    }
+
+    fn lag_trunk() -> SwitchDocument {
+        Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand()
+    }
+
+    /// Back and forth, and back again. The second trip into LACP has to look
+    /// like the first, whatever the kernel did to the ports in between.
+    #[test]
+    fn lag_to_flat_and_back_again_plans_the_same_way_both_times() {
+        let flat = Preset::flat().expand();
+        let into = joined(&plan(&flat, &lag_trunk()));
+        let out = joined(&plan(&lag_trunk(), &flat));
+        let again = joined(&plan(&flat, &lag_trunk()));
+        assert_eq!(into, again);
+
+        // Out of LACP: the bond goes and the slaves rejoin br0, where the
+        // kernel gives them VID 1: exactly what Flat wants, so no add.
+        assert!(
+            out.contains(&"ip link delete bond0".to_string()),
+            "{out:#?}"
+        );
+        assert!(
+            out.contains(&"ip link set dev ge0 master br0".to_string()),
+            "{out:#?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("bridge vlan add dev ge")),
+            "{out:#?}"
+        );
+        // Into LACP: bond0 is created and carries the trunk's VLANs.
+        assert!(
+            into.iter()
+                .any(|l| l.starts_with("ip link add bond0 type bond")),
+            "{into:#?}"
+        );
+        for vid in [10, 20] {
+            assert!(
+                into.contains(&format!("bridge vlan add dev bond0 vid {vid}")),
+                "{into:#?}"
+            );
+        }
+        assert!(
+            into.contains(&"bridge vlan del dev bond0 vid 1".to_string()),
+            "the kernel's default VID 1 on a new bridge port goes: {into:#?}"
+        );
+    }
+
+    /// The bond is made between the removals and the additions, and filtering
+    /// comes on after both: the order the rest of the plan relies on.
+    #[test]
+    fn the_bond_is_made_between_the_removals_and_the_additions() {
+        let lines = joined(&plan(&Preset::flat().expand(), &lag_trunk()));
+        let add_bond = lines
+            .iter()
+            .position(|l| l.starts_with("ip link add bond0"))
+            .unwrap();
+        let last_front_del = lines
+            .iter()
+            .rposition(|l| l.starts_with("bridge vlan del dev ge"))
+            .unwrap();
+        let first_front_add = lines
+            .iter()
+            .position(|l| l.starts_with("bridge vlan add dev node"))
+            .unwrap();
+        let on = lines
+            .iter()
+            .position(|l| l.contains("vlan_filtering 1"))
+            .unwrap();
+        assert!(last_front_del < add_bond, "{lines:#?}");
+        assert!(add_bond < first_front_add, "{lines:#?}");
+        assert!(first_front_add < on, "{lines:#?}");
+    }
+
+    #[test]
+    fn only_the_command_that_makes_the_bond_creates_it() {
+        let plan = plan(&Preset::flat().expand(), &lag_flat());
+        let creating: Vec<_> = plan.iter().filter(|c| creates_bond(c)).collect();
+        assert_eq!(creating.len(), 1, "{plan:#?}");
+        assert!(!creates_bond(&cmd(&["ip", "link", "delete", BOND])));
+        assert!(!creates_bond(&cmd(&[
+            "ip", "link", "set", "dev", BOND, "up"
+        ])));
+    }
+
+    /// A move into LACP that failed before it made the bond must not undo
+    /// itself by tearing a bond down: the one there is not its own.
+    #[test]
+    fn undoing_a_move_into_lag_that_never_made_the_bond_does_not_touch_it() {
+        let flat = Preset::flat().expand();
+        let undo = joined(&undo_plan(&flat, &lag_trunk(), false));
+        assert!(!undo.iter().any(|l| l.contains("bond0")), "{undo:#?}");
+        assert!(!undo.iter().any(|l| l.contains("nomaster")), "{undo:#?}");
+        assert!(
+            !undo.iter().any(|l| l.contains("master br0")),
+            "ge0 and ge1 were not moved, so are not moved back: {undo:#?}"
+        );
+        // What it can have done is put back: VLANs written from the old
+        // document.
+        assert!(
+            undo.contains(&"bridge vlan add dev ge0 vid 1 pvid untagged".to_string()),
+            "{undo:#?}"
+        );
+    }
+
+    /// Once the bond is made it is this plan's, and goes.
+    #[test]
+    fn undoing_a_move_into_lag_that_made_the_bond_removes_it() {
+        let flat = Preset::flat().expand();
+        let undo = joined(&undo_plan(&flat, &lag_trunk(), true));
+        assert!(
+            undo.contains(&"ip link delete bond0".to_string()),
+            "{undo:#?}"
+        );
+        assert!(
+            undo.contains(&"ip link set dev ge0 master br0".to_string()),
+            "{undo:#?}"
+        );
+    }
+
+    /// Out of LACP and back is not a move into it: the bond was there, and is
+    /// put back the same way whatever got made.
+    #[test]
+    fn undoing_a_move_out_of_lag_is_the_plain_inverse() {
+        let flat = Preset::flat().expand();
+        for created in [false, true] {
+            assert_eq!(
+                undo_plan(&lag_trunk(), &flat, created),
+                plan(&flat, &lag_trunk())
+            );
+        }
+    }
+
+    #[test]
+    fn the_bridge_vlan_listing_is_read_with_flags_and_ranges() {
+        let json = r#"[
+            {"ifname":"ge0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},
+                                      {"vlan":10,"vlanEnd":12}]},
+            {"ifname":"br0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]}]}
+        ]"#;
+        let held = parse_bridge_vlans(json).expect("parses");
+        let ge0 = &held["ge0"];
+        assert_eq!(ge0.len(), 4, "{ge0:?}");
+        assert_eq!(
+            ge0[&1],
+            KernelVlan {
+                pvid: true,
+                untagged: true
+            }
+        );
+        assert_eq!(ge0[&11], KernelVlan::default());
+        assert!(held["br0"].contains_key(&1));
+        assert_eq!(parse_bridge_vlans("not json"), None);
+        assert_eq!(
+            parse_bridge_vlans("{}"),
+            None,
+            "an object is not the listing"
+        );
+    }
+
+    /// The kernel's account of a switch that is in the state a document says
+    /// reads back as that document: what makes it a safe thing to plan from.
+    #[test]
+    fn a_switch_in_the_documents_state_reads_back_as_the_document() {
+        for document in [
+            Preset::flat().expand(),
+            Preset::Split.expand(),
+            trunk(),
+            Preset::Trunk {
+                management_vid: 10,
+                node_vid: 20,
+                second_uplink: SecondUplink::Off,
+            }
+            .expand(),
+            lag_flat(),
+            lag_trunk(),
+        ] {
+            let held = parse_bridge_vlans(&show_vlans_json(&document)).expect("parses");
+            let back = document_from_kernel(
+                &held,
+                document.vlan_filtering,
+                document.stp,
+                document.second_uplink == SecondUplink::Lag,
+                &document,
+            );
+            assert_eq!(back, document);
+        }
+    }
+
+    /// Where the kernel disagrees with what was meant, the kernel wins.
+    #[test]
+    fn the_kernel_wins_over_the_document_it_is_read_against() {
+        let intended = lag_trunk();
+        // The bond never got made, and ge0 kept a VLAN.
+        let held = parse_bridge_vlans(
+            r#"[{"ifname":"ge0","vlans":[{"vlan":10},{"vlan":1,"flags":["PVID","Egress Untagged"]}]}]"#,
+        )
+        .unwrap();
+        let read = document_from_kernel(&held, false, false, false, &intended);
+        assert_eq!(read.second_uplink, SecondUplink::Redundant);
+        assert!(!read.ports.contains_key(&PortId::Bond0));
+        assert!(!read.vlan_filtering);
+        assert_eq!(
+            read.ports[&PortId::Ge0],
+            PortConfig {
+                untagged: Some(1),
+                tagged: [10].into_iter().collect()
+            }
+        );
+        // The BMC's own entry is the document's: the kernel does not say.
+        assert_eq!(read.ports[&PortId::Bmc], intended.ports[&PortId::Bmc]);
+    }
+
+    /// A slave of the bond is not a bridge port and holds nothing, so a
+    /// healthy LACP switch is not expected to show VLANs on it.
+    #[test]
+    fn expected_vlans_skip_bond_slaves_and_the_bmc() {
+        let expected = expected_vlans(&lag_trunk());
+        assert!(expected.contains_key("bond0"));
+        assert!(!expected.contains_key("ge0"));
+        assert!(!expected.contains_key("br0"));
+        assert!(expected_vlans(&Preset::flat().expand()).is_empty());
     }
 }

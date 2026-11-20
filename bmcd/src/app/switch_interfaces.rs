@@ -27,12 +27,12 @@ use crate::app::address_document::{
     hook_argument, parse, resolv_conf, AddressDocument, INTERFACE, MARKER,
 };
 use crate::app::switch_applier::{
-    interface_name, plan, Command, BOND, BOND_LACP_RATE, BOND_MIIMON, BOND_MODE,
+    interface_name, is_best_effort, plan, Command, BOND, BOND_LACP_RATE, BOND_MIIMON, BOND_MODE,
     BOND_XMIT_HASH_POLICY,
 };
 use crate::app::switch_document::{PortId, Preset, SecondUplink, SwitchDocument};
 use crate::utils::write_durably;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Entire-line comment carrying the switch document this file was rendered
@@ -57,15 +57,21 @@ pub fn with_interfaces_lock<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// True when ifupdown-ng can bring up a `bond-slaves` stanza at boot.
+/// Where ifupdown-ng's bond executor may be on this image, as paths.
+pub fn bond_executor_paths() -> Vec<PathBuf> {
+    BOND_EXECUTOR_CANDIDATES.iter().map(PathBuf::from).collect()
+}
+
+/// True when one of `candidates` is ifupdown-ng's bond executor, which is what
+/// brings up a `bond-slaves` stanza at boot. The candidates are the caller's
+/// to choose, so a test can say where it is, or that it is nowhere.
+pub fn bond_executor_in(candidates: &[PathBuf]) -> bool {
+    candidates.iter().any(|path| path.is_file())
+}
+
+/// [`bond_executor_in`] for the paths on a real board.
 pub fn bond_executor_present() -> bool {
-    // Unit tests assert on the native stanza; the container has no executor.
-    if cfg!(test) {
-        return true;
-    }
-    BOND_EXECUTOR_CANDIDATES
-        .iter()
-        .any(|path| Path::new(path).is_file())
+    bond_executor_in(&bond_executor_paths())
 }
 
 /// Members of `br0`, derived from the same port names [`interface_name`] owns.
@@ -91,8 +97,18 @@ pub fn boot_baseline(wanted: &SwitchDocument) -> SwitchDocument {
     .expand()
 }
 
-/// Full `/etc/network/interfaces` for this address + switch pair.
+/// Full `/etc/network/interfaces` for this address + switch pair, with the
+/// bond declared in it when this image can bring one up from a file.
 pub fn render(address: &AddressDocument, switch: &SwitchDocument) -> String {
+    render_with(address, switch, bond_executor_present())
+}
+
+/// [`render`], told whether the bond executor is there rather than looking.
+pub fn render_with(
+    address: &AddressDocument,
+    switch: &SwitchDocument,
+    bond_executor: bool,
+) -> String {
     let header = format!(
         "{SWITCH_HEADER_PREFIX}{}\n",
         serde_json::to_string(switch).expect("SwitchDocument is serializable")
@@ -110,7 +126,7 @@ pub fn render(address: &AddressDocument, switch: &SwitchDocument) -> String {
     );
 
     let lag = switch.second_uplink == SecondUplink::Lag;
-    if lag && bond_executor_present() {
+    if lag && bond_executor {
         // The bond executor passes every bond-* line to `ip link add`, so
         // this matches switch_applier's live bond.
         out.push_str(&format!(
@@ -174,7 +190,15 @@ pub fn render(address: &AddressDocument, switch: &SwitchDocument) -> String {
     }
 
     for command in plan(&boot_baseline(switch), switch) {
-        out.push_str(&format!("  post-up {}\n", shell_join(&command)));
+        // ifupdown stops at a `post-up` that fails, and the lines after it
+        // would never run. A delete that may find nothing to delete must not
+        // be allowed to do that: see `is_best_effort`.
+        let tolerated = if is_best_effort(&command) {
+            " || true"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  post-up {}{tolerated}\n", shell_join(&command)));
     }
     out
 }
@@ -231,7 +255,17 @@ pub fn write_interfaces(
     address: &AddressDocument,
     switch: &SwitchDocument,
 ) -> std::io::Result<bool> {
-    let wanted = render(address, switch);
+    write_interfaces_with(path, address, switch, bond_executor_present())
+}
+
+/// [`write_interfaces`], told whether the bond executor is there.
+pub fn write_interfaces_with(
+    path: &Path,
+    address: &AddressDocument,
+    switch: &SwitchDocument,
+    bond_executor: bool,
+) -> std::io::Result<bool> {
+    let wanted = render_with(address, switch, bond_executor);
     let current = std::fs::read_to_string(path).unwrap_or_default();
     if current == wanted {
         return Ok(false);
@@ -279,7 +313,7 @@ mod tests {
             second_uplink: SecondUplink::Lag,
         }
         .expand();
-        let text = render(&AddressDocument::Dhcp, &switch);
+        let text = render_with(&AddressDocument::Dhcp, &switch, true);
         assert!(text.contains("auto bond0"));
         assert!(text.contains("node1 node2 node3 node4 bond0"));
         assert!(text.contains("bond-mode 802.3ad"));
@@ -300,7 +334,7 @@ mod tests {
             second_uplink: SecondUplink::Lag,
         }
         .expand();
-        let text = render(&AddressDocument::Dhcp, &switch);
+        let text = render_with(&AddressDocument::Dhcp, &switch, true);
         let back = switch_from_header(&text).expect("header");
         assert_eq!(back, switch);
     }
@@ -317,6 +351,51 @@ mod tests {
         assert!(
             text.contains("post-up bridge vlan add dev br0 vid 10 pvid untagged self"),
             "{text}"
+        );
+    }
+
+    /// An image with no bond executor cannot bring the bond up from the file,
+    /// so the file does not declare it; apply refuses LACP there.
+    #[test]
+    fn without_the_bond_executor_the_file_declares_no_bond() {
+        let switch = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let text = render_with(&AddressDocument::Dhcp, &switch, false);
+        assert!(!text.contains("auto bond0"), "{text}");
+    }
+
+    /// The executor is found where the caller says, not where the build is.
+    #[test]
+    fn the_bond_executor_is_looked_for_in_the_given_paths() {
+        let dir = tempdir::TempDir::new("switch-bond-executor").expect("temp dir");
+        let there = dir.path().join("bond");
+        std::fs::write(&there, "#!/bin/sh\n").unwrap();
+        let absent = dir.path().join("nowhere");
+        assert!(bond_executor_in(&[absent.clone(), there]));
+        assert!(!bond_executor_in(&[absent]));
+        assert!(!bond_executor_in(&[]));
+    }
+
+    /// `ifupdown` stops at a failing `post-up`, so the delete of an entry that
+    /// may not exist must not be able to fail the lines after it.
+    #[test]
+    fn a_post_up_that_may_find_nothing_to_delete_cannot_fail_the_rest() {
+        let switch = Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Off,
+        }
+        .expand();
+        let text = render(&AddressDocument::Dhcp, &switch);
+        assert!(
+            text.contains("  post-up bridge vlan del dev br0 vid 1 self || true\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("dev node1 vid 1 || true"),
+            "only the bridge's own delete is tolerated: {text}"
         );
     }
 

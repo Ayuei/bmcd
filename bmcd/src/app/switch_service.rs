@@ -37,20 +37,25 @@
 //! in the middle of an unconfirmed change finds the previous document there,
 //! because the pending one was never written.
 
-use crate::app::address_document::{parse, AddressDocument};
+use crate::app::address_applier::{ApplyError, Exec, SystemExec};
+use crate::app::address_document::parse;
 use crate::app::address_service::{keep_a_copy_for_switch, INTERFACES_FILE};
-use crate::app::switch_applier::{interface_name, is_best_effort, plan, Command, BOND};
+use crate::app::switch_applier::{
+    creates_bond, document_from_kernel, expected_vlans, interface_name, is_best_effort,
+    parse_bridge_vlans, plan, undo_plan, Command, KernelVlans, BOND, BRIDGE, SHOW_VLANS,
+};
 use crate::app::switch_change::{
     ChangeError, Effect, Pending, RevertRecord, SwitchState, DEFAULT_WINDOW,
 };
 use crate::app::switch_document::{PortId, Preset, SecondUplink, SwitchDocument};
 use crate::app::switch_interfaces::{
-    address_for_rewrite, bond_executor_present, render, switch_from_header, with_interfaces_lock,
-    write_interfaces, HandWrittenInterfaces,
+    address_for_rewrite, bond_executor_in, bond_executor_paths, boot_baseline, render_with,
+    switch_from_header, with_interfaces_lock, write_interfaces_with, HandWrittenInterfaces,
 };
 use crate::utils::write_durably;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 
@@ -101,6 +106,9 @@ pub enum SwitchError {
     HandWritten(String),
     /// LACP needs ifupdown-ng's bond executor so a reboot can bring `bond0` up.
     MissingBondExecutor(String),
+    /// `bond0` is already there and this daemon did not make it. Nothing was
+    /// changed.
+    BondExists(String),
 }
 
 impl std::fmt::Display for SwitchError {
@@ -113,7 +121,8 @@ impl std::fmt::Display for SwitchError {
             SwitchError::Io(e) => write!(f, "{e}"),
             SwitchError::NoBridge(m)
             | SwitchError::HandWritten(m)
-            | SwitchError::MissingBondExecutor(m) => write!(f, "{m}"),
+            | SwitchError::MissingBondExecutor(m)
+            | SwitchError::BondExists(m) => write!(f, "{m}"),
         }
     }
 }
@@ -131,6 +140,10 @@ pub struct SwitchService {
     interfaces_path: PathBuf,
     /// Where to look for `br0`; the kernel's, unless a test says otherwise.
     net_class: PathBuf,
+    /// Where ifupdown-ng's bond executor may be installed on this image.
+    bond_executors: Vec<PathBuf>,
+    /// Runs `ip` and `bridge`. The real thing, unless a test says otherwise.
+    exec: Arc<dyn Exec>,
 }
 
 struct Inner {
@@ -170,7 +183,116 @@ impl SwitchService {
             path,
             interfaces_path: PathBuf::from(INTERFACES_FILE),
             net_class: NET_CLASS.into(),
+            bond_executors: bond_executor_paths(),
+            exec: Arc::new(SystemExec),
         }
+    }
+
+    /// Tests run the plan against a recording stand-in instead of `ip`.
+    #[cfg(test)]
+    pub fn with_exec(mut self, exec: Arc<dyn Exec>) -> Self {
+        self.exec = exec;
+        self
+    }
+
+    /// Tests say where the bond executor is, or that it is nowhere.
+    #[cfg(test)]
+    pub fn with_bond_executors(mut self, paths: Vec<PathBuf>) -> Self {
+        self.bond_executors = paths;
+        self
+    }
+
+    fn bond_native(&self) -> bool {
+        bond_executor_in(&self.bond_executors)
+    }
+
+    fn bond_present(&self) -> bool {
+        self.net_class.join(BOND).exists()
+    }
+
+    /// `br0`'s `vlan_filtering`, from the bridge itself.
+    fn kernel_filtering(&self) -> Option<bool> {
+        self.bridge_flag("vlan_filtering").map(|v| v != 0)
+    }
+
+    /// Whether `br0` runs spanning tree: the kernel's `stp_state` is 0 (off),
+    /// 1 (kernel STP) or 2 (user-space STP).
+    fn kernel_stp(&self) -> Option<bool> {
+        self.bridge_flag("stp_state").map(|v| v != 0)
+    }
+
+    fn bridge_flag(&self, name: &str) -> Option<u32> {
+        std::fs::read_to_string(self.net_class.join(BRIDGE).join("bridge").join(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// What the bridge ports are in, per `bridge -j vlan show`. `None` when
+    /// that cannot be run or read, which is "unknown", never "nothing".
+    fn kernel_vlans(&self) -> Option<KernelVlans> {
+        let (program, args) = SHOW_VLANS.split_first().expect("a command has a program");
+        match self.exec.run(program, args) {
+            Ok(out) => parse_bridge_vlans(&out),
+            Err(e) => {
+                tracing::warn!("could not read the bridge VLANs: {e}");
+                None
+            }
+        }
+    }
+
+    /// What is missing from the kernel that `document` says should be there:
+    /// `bond0` for LACP, `vlan_filtering` on `br0`, and each front port's
+    /// VLANs. `None` when it all is.
+    ///
+    /// The `interfaces` file matching the document only says `ifup` was given
+    /// the right lines. If `ifup br0` stopped before the `post-up` lines ran
+    /// (DHCP failing on an untagged, unfiltered bridge is enough), the VLANs
+    /// are not there and the file is no evidence otherwise.
+    fn kernel_drift(&self, document: &SwitchDocument) -> Option<String> {
+        if document.second_uplink == SecondUplink::Lag && !self.bond_present() {
+            return Some(format!("{BOND} does not exist"));
+        }
+        match self.kernel_filtering() {
+            Some(held) if held == document.vlan_filtering => {}
+            Some(held) => {
+                return Some(format!(
+                    "{BRIDGE} has vlan_filtering {}, the document wants {}",
+                    u8::from(held),
+                    u8::from(document.vlan_filtering)
+                ))
+            }
+            None => return Some(format!("{BRIDGE}'s vlan_filtering cannot be read")),
+        }
+        let expected = expected_vlans(document);
+        if expected.is_empty() {
+            return None;
+        }
+        let Some(held) = self.kernel_vlans() else {
+            return Some("`bridge vlan show` cannot be read".to_string());
+        };
+        for (name, vids) in expected {
+            for vid in vids {
+                if !held.get(name).is_some_and(|port| port.contains_key(&vid)) {
+                    return Some(format!("{name} is not in VLAN {vid}"));
+                }
+            }
+        }
+        None
+    }
+
+    /// The switch as the kernel reports it, for after a plan that did not run
+    /// clean: what `fallback` says is running is then a guess, and the next
+    /// plan would be computed from it. Falls back to `fallback` when the
+    /// kernel cannot be read.
+    fn running_from_reality(&self, fallback: &SwitchDocument) -> SwitchDocument {
+        let (Some(vlans), Some(filtering)) = (self.kernel_vlans(), self.kernel_filtering()) else {
+            tracing::warn!("could not read the switch back from the kernel; keeping the document");
+            return fallback.clone();
+        };
+        let stp = self.kernel_stp().unwrap_or(fallback.stp);
+        document_from_kernel(&vlans, filtering, stp, self.bond_present(), fallback)
     }
 
     /// Look for `br0` somewhere other than the kernel's `/sys/class/net`.
@@ -237,7 +359,7 @@ impl SwitchService {
             let disk = std::fs::read_to_string(&self.interfaces_path).unwrap_or_default();
             match address_for_rewrite(&disk) {
                 Ok(address) => {
-                    let expected = render(&address, &document);
+                    let expected = render_with(&address, &document, self.bond_native());
                     if disk == expected {
                         return Ok((None, true));
                     }
@@ -267,23 +389,50 @@ impl SwitchService {
                         "{} is hand-written; switch heal will not rewrite it (live apply only)",
                         self.interfaces_path.display()
                     );
-                    Ok((Some(Preset::flat().expand()), true))
+                    // A bond0 that is already up (a hand-written bond) is not
+                    // ours to create again: plan from a baseline that has it.
+                    let baseline =
+                        if document.second_uplink == SecondUplink::Lag && self.bond_present() {
+                            boot_baseline(&document)
+                        } else {
+                            Preset::flat().expand()
+                        };
+                    Ok((Some(baseline), true))
                 }
             }
         })?;
 
         if skip_rewrite && baseline.is_none() {
-            inner.running = document;
-            tracing::info!(
-                "switch configuration matches {}; heal skipped",
+            // The file matches, which says `ifup` was given the right lines,
+            // not that it ran them. Look at the kernel before believing it.
+            let Some(why) = self.kernel_drift(&document) else {
+                inner.running = document;
+                tracing::info!(
+                    "switch configuration matches {} and the kernel; heal skipped",
+                    self.interfaces_path.display()
+                );
+                return Ok(());
+            };
+            tracing::warn!(
+                "{} matches the confirmed switch document but the kernel does not ({why}); \
+                 running its boot lines once",
                 self.interfaces_path.display()
             );
+            // With no bond the plan has to make it; otherwise only the
+            // `post-up` part is missing, which is what the file's lines are.
+            let baseline = if document.second_uplink == SecondUplink::Lag && !self.bond_present() {
+                Preset::flat().expand()
+            } else {
+                boot_baseline(&document)
+            };
+            run_all(self.exec.as_ref(), &plan(&baseline, &document))?;
+            inner.running = document;
             return Ok(());
         }
 
         let baseline = baseline.unwrap_or_else(|| Preset::flat().expand());
         let commands = plan(&baseline, &document);
-        run_all(&commands).await?;
+        run_all(self.exec.as_ref(), &commands)?;
         inner.running = document;
         tracing::info!("switch configuration applied from {}", self.path.display());
         Ok(())
@@ -301,6 +450,13 @@ impl SwitchService {
     }
 
     /// Apply a document and start waiting to be proved right.
+    ///
+    /// A hand-written `interfaces` file is only ever in the way of LACP.
+    /// Every other document is applied live and persisted in `switch.json`, and
+    /// at boot the file is left alone and the document applied from it, as it
+    /// always was. LACP needs `bond0` declared in the file, so that a reboot
+    /// can bring the bond up before this daemon starts; replacing the file is
+    /// then a decision, and `replace_hand_written` is how the request makes it.
     pub async fn apply(
         &self,
         document: SwitchDocument,
@@ -308,7 +464,8 @@ impl SwitchService {
         replace_hand_written: bool,
     ) -> Result<Pending, SwitchError> {
         self.bridge_check()?;
-        if document.second_uplink == SecondUplink::Lag && !bond_executor_present() {
+        let lag = document.second_uplink == SecondUplink::Lag;
+        if lag && !self.bond_native() {
             return Err(SwitchError::MissingBondExecutor(
                 "LACP needs ifupdown-ng's bond executor on this image so a reboot can bring \
                  bond0 up; install it, or use independent uplinks."
@@ -316,16 +473,36 @@ impl SwitchService {
             ));
         }
 
-        let hand_written = with_interfaces_lock(|| {
+        let (hand_written, address_readable) = with_interfaces_lock(|| {
             let disk = std::fs::read_to_string(&self.interfaces_path).unwrap_or_default();
-            matches!(address_for_rewrite(&disk), Err(HandWrittenInterfaces))
+            (
+                matches!(address_for_rewrite(&disk), Err(HandWrittenInterfaces)),
+                parse(&disk).document.is_some(),
+            )
         });
-        if hand_written && !replace_hand_written {
-            return Err(SwitchError::HandWritten(self.hand_written_message()));
+        if lag && hand_written {
+            if !replace_hand_written {
+                return Err(SwitchError::HandWritten(self.hand_written_message()));
+            }
+            if !address_readable {
+                return Err(SwitchError::HandWritten(self.unreadable_address_message()));
+            }
         }
 
         let mut inner = self.inner.lock().await;
-        inner.replaces_hand_written = hand_written;
+        // A bond this daemon did not make is not one it may create again, and
+        // not one a failed attempt may take down.
+        if lag && inner.running.second_uplink != SecondUplink::Lag && self.bond_present() {
+            return Err(SwitchError::BondExists(
+                "bond0 already exists on this board and this daemon did not create it (a \
+                 hand-written interfaces file, or an earlier run). Creating it again would fail, \
+                 and undoing a failed attempt could take your bond down with it. Remove bond0, \
+                 or keep managing it by hand; nothing was changed."
+                    .into(),
+            ));
+        }
+
+        inner.replaces_hand_written = hand_written && lag;
         let running = inner.running.clone();
         let token = new_token();
         let (pending, effect) =
@@ -336,13 +513,16 @@ impl SwitchService {
         if let Effect::Apply(document) = effect {
             let previous = inner.running.clone();
             let commands = plan(&previous, &document);
-            // A failure here leaves the switch part-way. Roll back best-effort
-            // with the inverse plan (steps that never ran usually fail too),
-            // then drop the pending change.
-            if let Err(e) = run_all(&commands).await {
-                let undo = plan(&document, &previous);
-                run_best_effort(&undo).await;
-                inner.running = previous;
+            // A failure here leaves the switch part-way. Undo what it did,
+            // best-effort (steps that never ran usually fail too), and then
+            // drop the pending change. What is undone is only what this apply
+            // did: see [`undo_plan`].
+            let (done, outcome) = run_plan(self.exec.as_ref(), &commands);
+            if let Err(e) = outcome {
+                let bond_created = commands[..done].iter().any(creates_bond);
+                let undo = undo_plan(&previous, &document, bond_created);
+                let _ = run_best_effort(self.exec.as_ref(), &undo);
+                inner.running = self.running_from_reality(&previous);
                 let _ = inner.state.revert(SystemTime::now());
                 return Err(e);
             }
@@ -354,9 +534,22 @@ impl SwitchService {
     fn hand_written_message(&self) -> String {
         let path = self.interfaces_path.display();
         format!(
-            "{path} was written by hand. A confirmed switch change replaces the whole file (a \
-             copy of the current one is kept as {path}.hand-written.<time>). Send \
-             replace_hand_written to proceed."
+            "{path} was written by hand, and LACP needs bond0 declared in it so that a reboot can \
+             bring the bond up. A confirmed LACP change replaces the whole file (a copy of the \
+             current one is kept as {path}.hand-written.<time>). To go ahead, tick the option to \
+             replace the hand-written file in the interface, pass `--replace-hand-written` to \
+             `tpi`, or send `replace_hand_written: true` in the request. Or keep the file and use \
+             independent uplinks. Nothing was changed."
+        )
+    }
+
+    fn unreadable_address_message(&self) -> String {
+        let path = self.interfaces_path.display();
+        format!(
+            "{path} was written by hand and the address in its br0 stanza cannot be read (it is \
+             neither DHCP nor a static address with a netmask or prefix), so replacing the file \
+             would change how this board gets its address. Set the address through the address \
+             settings first, or edit the file over SSH. Nothing was changed."
         )
     }
 
@@ -372,7 +565,7 @@ impl SwitchService {
     /// BMC's own VLAN, because those are the only paths a confirmation could
     /// arrive over. With `Trunk` redundant that is both, and either forwarding
     /// is enough -- spanning tree will have blocked the other on purpose.
-    async fn start_window_if_reachable(&self, inner: &mut Inner) {
+    async fn start_window_if_reachable(&self, inner: &mut Inner, now: SystemTime) {
         let Some(pending) = inner.state.pending() else {
             return;
         };
@@ -387,28 +580,39 @@ impl SwitchService {
         else {
             // Filtering off: there is no VLAN to be reachable on, and nothing
             // to wait for.
-            inner.state.uplink_forwarding(SystemTime::now());
+            inner.state.uplink_forwarding(now);
             return;
         };
 
         let forwarding = if document.second_uplink == SecondUplink::Lag {
-            is_forwarding(Path::new(NET_CLASS), BOND)
+            is_forwarding(&self.net_class, BOND)
         } else {
             document
                 .members(management)
                 .into_iter()
                 .filter(|port| port.is_uplink())
                 .filter_map(interface_name)
-                .any(|name| is_forwarding(Path::new(NET_CLASS), name))
+                .any(|name| is_forwarding(&self.net_class, name))
         };
 
         if forwarding {
             tracing::info!("the uplink is forwarding; the confirm window starts now");
-            inner.state.uplink_forwarding(SystemTime::now());
+            inner.state.uplink_forwarding(now);
         }
     }
 
     pub async fn confirm(&self, token: &str) -> Result<(), SwitchError> {
+        self.confirm_at(token, SystemTime::now()).await
+    }
+
+    /// [`confirm`](Self::confirm) at a given time.
+    ///
+    /// One timestamp for the check and the commit. Writing the two files takes
+    /// as long as flash takes, and a clock read again afterwards could find the
+    /// window gone: the commit would then refuse after both files were written,
+    /// the timer would put the old document back, and the next boot would come
+    /// up on a configuration nobody confirmed.
+    pub(crate) async fn confirm_at(&self, token: &str, now: SystemTime) -> Result<(), SwitchError> {
         let mut inner = self.inner.lock().await;
         // Check first, write both files, and only then commit. A refusal or a
         // write that fails leaves the change pending: it can be confirmed
@@ -416,7 +620,7 @@ impl SwitchService {
         // goes first: if `switch.json` then fails, boot heal plans from the
         // header back to the confirmed document, whereas the other order would
         // leave a confirmed document nobody confirmed.
-        let document = inner.state.check_confirm(token, SystemTime::now())?;
+        let document = inner.state.check_confirm(token, now)?;
         let keep_copy = inner.replaces_hand_written;
         with_interfaces_lock(|| self.write_interfaces_twin(&document, keep_copy))?;
         write_durably(
@@ -425,7 +629,7 @@ impl SwitchService {
                 .map_err(|e| SwitchError::Io(std::io::Error::other(e)))?,
         )
         .map_err(SwitchError::Io)?;
-        inner.state.confirm(token, SystemTime::now())?;
+        inner.state.confirm(token, now)?;
         inner.replaces_hand_written = false;
         tracing::info!(
             "switch configuration confirmed and persisted ({}, {})",
@@ -436,8 +640,9 @@ impl SwitchService {
     }
 
     /// Rewrite `interfaces` for `document`, keeping the address stanza. A
-    /// hand-written file is replaced only with the opt-in from apply, and only
-    /// after a copy is kept; a write that fails removes that copy again.
+    /// hand-written file is replaced only for LACP, only with the opt-in from
+    /// apply, and only after a copy is kept; a write that fails removes that
+    /// copy again. For any other document a hand-written file is left alone.
     fn write_interfaces_twin(
         &self,
         document: &SwitchDocument,
@@ -446,12 +651,20 @@ impl SwitchService {
         let disk = std::fs::read_to_string(&self.interfaces_path).unwrap_or_default();
         let address = match address_for_rewrite(&disk) {
             Ok(address) => address,
-            // Opt-in already happened at apply; keep a parseable address
-            // from the hand file when we can, else DHCP -- never invent a
-            // static layout from a file we could not read.
-            Err(HandWrittenInterfaces) if keep_copy => {
-                parse(&disk).document.unwrap_or(AddressDocument::Dhcp)
+            // Nothing in this document needs the file: it is applied live and
+            // at boot from `switch.json`, exactly as before the file was ever
+            // written by this daemon. Not ours to replace.
+            Err(HandWrittenInterfaces) if document.second_uplink != SecondUplink::Lag => {
+                return Ok(());
             }
+            // Opt-in already happened at apply. Keep the address from the hand
+            // file when it can be read; never turn one that cannot into DHCP.
+            Err(HandWrittenInterfaces) if keep_copy => match parse(&disk).document {
+                Some(address) => address,
+                None => {
+                    return Err(SwitchError::HandWritten(self.unreadable_address_message()));
+                }
+            },
             Err(HandWrittenInterfaces) => {
                 return Err(SwitchError::HandWritten(self.hand_written_message()))
             }
@@ -470,7 +683,12 @@ impl SwitchService {
             }
             backup = Some(kept);
         }
-        if let Err(e) = write_interfaces(&self.interfaces_path, &address, document) {
+        if let Err(e) = write_interfaces_with(
+            &self.interfaces_path,
+            &address,
+            document,
+            self.bond_native(),
+        ) {
             if let Some(kept) = &backup {
                 let _ = std::fs::remove_file(kept);
             }
@@ -488,9 +706,14 @@ impl SwitchService {
     /// Called on a timer. Starts a window whose uplink has come up, and puts
     /// an unconfirmed change back once its window has passed.
     pub async fn tick(&self) {
+        self.tick_at(SystemTime::now()).await
+    }
+
+    /// [`tick`](Self::tick) at a given time.
+    pub(crate) async fn tick_at(&self, now: SystemTime) {
         let mut inner = self.inner.lock().await;
-        self.start_window_if_reachable(&mut inner).await;
-        let effect = inner.state.tick(SystemTime::now());
+        self.start_window_if_reachable(&mut inner, now).await;
+        let effect = inner.state.tick(now);
         if matches!(effect, Effect::None) {
             return;
         }
@@ -502,11 +725,23 @@ impl SwitchService {
         }
     }
 
+    /// Put a document back on the switch, for a revert.
+    ///
+    /// Best-effort, unlike an apply: every command is tried even after one
+    /// fails. A revert that stopped at the first error would leave ge0 and ge1
+    /// half-moved between the bond and the bridge and the BMC off the network,
+    /// with nothing above to try again. And `running` is then read back from
+    /// the kernel rather than taken from the document, because after a failure
+    /// the document is not what is running.
     async fn carry_out(&self, inner: &mut Inner, effect: Effect) -> Result<(), SwitchError> {
         if let Effect::Apply(document) = effect {
             let commands = plan(&inner.running, &document);
-            run_all(&commands).await?;
-            inner.running = document;
+            let outcome = run_best_effort(self.exec.as_ref(), &commands);
+            inner.running = match &outcome {
+                Ok(()) => document,
+                Err(_) => self.running_from_reality(&document),
+            };
+            return outcome;
         }
         Ok(())
     }
@@ -561,53 +796,63 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Run the plan, stopping at the first failure.
+/// Run one command through `exec`.
+fn run_command(exec: &dyn Exec, command: &Command) -> Result<(), SwitchError> {
+    let (program, args) = command.split_first().expect("a command has a program");
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    exec.run(program, &args).map(|_| ()).map_err(|e| match e {
+        ApplyError::Command { detail, .. } => SwitchError::Command {
+            command: command.join(" "),
+            detail,
+        },
+        ApplyError::Io(e) => SwitchError::Io(e),
+    })
+}
+
+/// Run the plan, stopping at the first failure. Returns how many commands were
+/// done, and how it ended.
 ///
-/// `std::process::Command`, like the rest of this daemon's few shell-outs.
-/// Each of these returns in well under a millisecond -- they are ioctls with a
-/// command line in front of them -- so handing the runtime a blocking task per
-/// command would cost more than it saved.
-async fn run_all(commands: &[Command]) -> Result<(), SwitchError> {
-    for command in commands {
-        match run_one(command).await {
+/// Each command is an ioctl with a command line in front of it and returns in
+/// well under a millisecond, so there is no handing the runtime a blocking
+/// task per command: that would cost more than it saved.
+fn run_plan(exec: &dyn Exec, commands: &[Command]) -> (usize, Result<(), SwitchError>) {
+    for (done, command) in commands.iter().enumerate() {
+        match run_command(exec, command) {
             Err(SwitchError::Command { detail, .. }) if is_best_effort(command) => {
                 tracing::warn!("{} failed, carrying on: {detail}", command.join(" "));
             }
-            other => other?,
+            Err(e) => return (done, Err(e)),
+            Ok(()) => {}
         }
     }
-    Ok(())
+    (commands.len(), Ok(()))
 }
 
-/// Inverse-plan rollback: keep going past errors so later undo steps still run.
-async fn run_best_effort(commands: &[Command]) {
+/// [`run_plan`] for a caller with nothing to do about a failure part-way.
+fn run_all(exec: &dyn Exec, commands: &[Command]) -> Result<(), SwitchError> {
+    run_plan(exec, commands).1
+}
+
+/// Run every command, going past errors so later steps still run. The first
+/// error is returned, after the rest has been tried.
+fn run_best_effort(exec: &dyn Exec, commands: &[Command]) -> Result<(), SwitchError> {
+    let mut first = None;
     for command in commands {
-        if let Err(e) = run_one(command).await {
-            tracing::warn!("switch undo step failed: {e}");
+        if let Err(e) = run_command(exec, command) {
+            tracing::warn!("switch step failed, carrying on: {e}");
+            first.get_or_insert(e);
         }
     }
-}
-
-async fn run_one(command: &Command) -> Result<(), SwitchError> {
-    let (program, args) = command.split_first().expect("a command has a program");
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(SwitchError::Io)?;
-    if !output.status.success() {
-        return Err(SwitchError::Command {
-            command: command.join(" "),
-            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::address_document::AddressDocument;
+    use crate::app::switch_applier::show_vlans_json;
+    use crate::app::switch_change::START_CEILING;
     use crate::app::switch_document::SecondUplink;
-    use crate::app::switch_interfaces::{render, switch_from_header, write_interfaces};
 
     fn trunk() -> SwitchDocument {
         Preset::Trunk {
@@ -785,56 +1030,304 @@ mod tests {
         let dir = tempdir::TempDir::new("switch-confirm-ifaces").expect("temp dir");
         let interfaces = dir.path().join("interfaces");
         // Persist path shared by confirm: header + bond stanza round-trip.
-        let document = Preset::Flat {
-            second_uplink: SecondUplink::Lag,
-        }
-        .expand();
-        write_interfaces(&interfaces, &AddressDocument::Dhcp, &document).unwrap();
+        let document = lag_flat();
+        write_interfaces_with(&interfaces, &AddressDocument::Dhcp, &document, true).unwrap();
         let text = std::fs::read_to_string(&interfaces).unwrap();
         assert!(text.contains(crate::app::switch_interfaces::SWITCH_HEADER_PREFIX));
         assert!(text.contains("auto bond0"));
         assert_eq!(switch_from_header(&text).expect("header"), document);
     }
 
-    #[tokio::test]
-    async fn boot_heal_skips_when_interfaces_already_match() {
-        let dir = tempdir::TempDir::new("switch-heal-match").expect("temp dir");
-        let document = Preset::flat().expand();
-        let switch_path = dir.path().join("switch.json");
-        std::fs::write(&switch_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        let interfaces = dir.path().join("interfaces");
-        let text = render(
-            &crate::app::address_document::AddressDocument::Dhcp,
-            &document,
-        );
-        std::fs::write(&interfaces, &text).unwrap();
+    // ---- fixtures for what runs and what the kernel says ------------------
 
-        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
-        service.boot_apply().await.expect("heal");
-        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), text);
-        assert_eq!(service.view().await.running, document);
+    fn lag_flat() -> SwitchDocument {
+        Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand()
     }
 
-    /// A hand-written interfaces file is left alone at boot. The confirmed
-    /// document is Flat, so the plan from the image's Flat is empty and the
-    /// test runs no `ip` or `bridge` command on the machine running it.
+    fn lag_trunk() -> SwitchDocument {
+        Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand()
+    }
+
+    /// Stands in for `ip` and `bridge`: records every command, fails the ones
+    /// that match a fragment it was told to fail, and answers `bridge -j vlan
+    /// show` with whatever it was given.
+    #[derive(Default)]
+    struct FakeExec {
+        calls: std::sync::Mutex<Vec<String>>,
+        failing: std::sync::Mutex<Vec<String>>,
+        vlans: std::sync::Mutex<String>,
+    }
+
+    impl FakeExec {
+        fn new() -> Arc<Self> {
+            Arc::new(FakeExec::default())
+        }
+        fn fail(&self, fragment: &str) {
+            self.failing.lock().unwrap().push(fragment.to_string());
+        }
+        fn set_vlans(&self, json: &str) {
+            *self.vlans.lock().unwrap() = json.to_string();
+        }
+        /// Every command so far except the read of the VLAN listing.
+        fn ran(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.as_str() != "bridge -j vlan show")
+                .cloned()
+                .collect()
+        }
+        fn forget(&self) {
+            self.calls.lock().unwrap().clear();
+        }
+        fn ran_any(&self, fragment: &str) -> bool {
+            self.ran().iter().any(|c| c.contains(fragment))
+        }
+    }
+
+    impl Exec for FakeExec {
+        fn run(&self, program: &str, args: &[&str]) -> Result<String, ApplyError> {
+            let line = format!("{program} {}", args.join(" "));
+            self.calls.lock().unwrap().push(line.clone());
+            if line == "bridge -j vlan show" {
+                return Ok(self.vlans.lock().unwrap().clone());
+            }
+            if self
+                .failing
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| line.contains(f))
+            {
+                return Err(ApplyError::Command {
+                    command: line,
+                    detail: "refused".into(),
+                });
+            }
+            Ok(String::new())
+        }
+    }
+
+    /// A board's `/sys/class/net`, as far as this service reads it.
+    fn net(dir: &Path, filtering: bool, bond: bool) -> PathBuf {
+        let net = dir.join("net");
+        std::fs::create_dir_all(net.join("br0").join("bridge")).unwrap();
+        let bridge = net.join("br0").join("bridge");
+        std::fs::write(
+            bridge.join("vlan_filtering"),
+            if filtering { "1\n" } else { "0\n" },
+        )
+        .unwrap();
+        std::fs::write(bridge.join("stp_state"), "0\n").unwrap();
+        if bond {
+            std::fs::create_dir_all(net.join("bond0")).unwrap();
+        }
+        net
+    }
+
+    /// A file standing for ifupdown-ng's bond executor.
+    fn executor(dir: &Path) -> Vec<PathBuf> {
+        let path = dir.join("bond-executor");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        vec![path]
+    }
+
+    /// A service on a fake board: the kernel's view, the files, the commands.
+    struct Rig {
+        dir: tempdir::TempDir,
+        service: SwitchService,
+        exec: Arc<FakeExec>,
+        interfaces: PathBuf,
+        switch: PathBuf,
+    }
+
+    fn rig(name: &str, filtering: bool, bond: bool, interfaces: Option<&str>) -> Rig {
+        let dir = tempdir::TempDir::new(name).expect("temp dir");
+        let exec = FakeExec::new();
+        let interfaces_path = dir.path().join("interfaces");
+        if let Some(text) = interfaces {
+            std::fs::write(&interfaces_path, text).unwrap();
+        }
+        let switch = dir.path().join("switch.json");
+        let service = SwitchService::load(&switch)
+            .with_interfaces_path(&interfaces_path)
+            .with_net_class(net(dir.path(), filtering, bond))
+            .with_bond_executors(executor(dir.path()))
+            .with_exec(exec.clone());
+        Rig {
+            dir,
+            service,
+            exec,
+            interfaces: interfaces_path,
+            switch,
+        }
+    }
+
+    /// A rig whose confirmed document is `document`, with its `interfaces`
+    /// rendered for it, so that boot heal sees a file that matches.
+    fn booted(name: &str, document: &SwitchDocument, filtering: bool, bond: bool) -> Rig {
+        let dir = tempdir::TempDir::new(name).expect("temp dir");
+        let exec = FakeExec::new();
+        let interfaces_path = dir.path().join("interfaces");
+        let executors = executor(dir.path());
+        std::fs::write(
+            &interfaces_path,
+            render_with(&AddressDocument::Dhcp, document, true),
+        )
+        .unwrap();
+        let switch = dir.path().join("switch.json");
+        std::fs::write(&switch, serde_json::to_vec_pretty(document).unwrap()).unwrap();
+        let service = SwitchService::load(&switch)
+            .with_interfaces_path(&interfaces_path)
+            .with_net_class(net(dir.path(), filtering, bond))
+            .with_bond_executors(executors)
+            .with_exec(exec.clone());
+        Rig {
+            dir,
+            service,
+            exec,
+            interfaces: interfaces_path,
+            switch,
+        }
+    }
+
+    // ---- boot heal --------------------------------------------------------
+
+    /// The file and the kernel both match: nothing is run but the read.
+    #[tokio::test]
+    async fn boot_heal_skips_when_interfaces_and_the_kernel_both_match() {
+        let document = trunk();
+        let rig = booted("switch-heal-match", &document, true, false);
+        rig.exec.set_vlans(&show_vlans_json(&document));
+        let text = std::fs::read_to_string(&rig.interfaces).unwrap();
+
+        rig.service.boot_apply().await.expect("heal");
+        assert_eq!(std::fs::read_to_string(&rig.interfaces).unwrap(), text);
+        assert_eq!(rig.exec.ran(), Vec::<String>::new());
+        assert_eq!(rig.service.view().await.running, document);
+    }
+
+    /// `ifup br0` stopped before its `post-up` lines ran (DHCP failing on an
+    /// unfiltered bridge is enough): the file is right and the switch is not.
+    #[tokio::test]
+    async fn boot_heal_runs_the_boot_lines_when_the_file_matches_but_filtering_is_off() {
+        let document = trunk();
+        let rig = booted("switch-heal-nofilter", &document, false, false);
+        rig.exec.set_vlans("[]");
+
+        rig.service.boot_apply().await.expect("heal");
+        assert!(
+            rig.exec.ran_any("vlan_filtering 1"),
+            "{:#?}",
+            rig.exec.ran()
+        );
+        assert!(
+            rig.exec
+                .ran()
+                .contains(&"bridge vlan add dev node1 vid 20 pvid untagged".to_string()),
+            "{:#?}",
+            rig.exec.ran()
+        );
+        assert_eq!(rig.service.view().await.running, document);
+    }
+
+    #[tokio::test]
+    async fn boot_heal_runs_the_boot_lines_when_a_front_port_lacks_its_vlans() {
+        let document = trunk();
+        let rig = booted("switch-heal-missing", &document, true, false);
+        // Everything is there but node1's VLAN.
+        let mut partial = document.clone();
+        partial.ports.insert(PortId::Node1, Default::default());
+        rig.exec.set_vlans(&show_vlans_json(&partial));
+
+        rig.service.boot_apply().await.expect("heal");
+        assert!(
+            rig.exec
+                .ran()
+                .contains(&"bridge vlan add dev node1 vid 20 pvid untagged".to_string()),
+            "{:#?}",
+            rig.exec.ran()
+        );
+    }
+
+    /// A listing that cannot be read is not evidence that all is well.
+    #[tokio::test]
+    async fn boot_heal_does_not_take_an_unreadable_listing_for_a_match() {
+        let document = trunk();
+        let rig = booted("switch-heal-unreadable", &document, true, false);
+        rig.exec.set_vlans("not json at all");
+        rig.service.boot_apply().await.expect("heal");
+        assert!(rig.exec.ran_any("bridge vlan add"), "{:#?}", rig.exec.ran());
+    }
+
+    /// LACP on a board where the bond never came up: heal makes it.
+    #[tokio::test]
+    async fn boot_heal_makes_the_bond_when_the_file_matches_but_bond0_is_missing() {
+        let document = lag_flat();
+        let rig = booted("switch-heal-nobond", &document, false, false);
+        rig.service.boot_apply().await.expect("heal");
+        assert!(
+            rig.exec.ran_any("ip link add bond0"),
+            "{:#?}",
+            rig.exec.ran()
+        );
+        assert_eq!(rig.service.view().await.running, document);
+    }
+
+    #[tokio::test]
+    async fn boot_heal_leaves_a_working_bond_alone() {
+        let document = lag_flat();
+        let rig = booted("switch-heal-bond", &document, false, true);
+        rig.service.boot_apply().await.expect("heal");
+        assert_eq!(rig.exec.ran(), Vec::<String>::new());
+    }
+
+    /// A hand-written file is left alone at boot. The confirmed document is
+    /// Flat, so the plan from the image's Flat is empty.
     #[tokio::test]
     async fn boot_heal_does_not_rewrite_a_hand_written_file() {
-        let dir = tempdir::TempDir::new("switch-heal-hand").expect("temp dir");
         let document = Preset::flat().expand();
-        let switch_path = dir.path().join("switch.json");
-        std::fs::write(&switch_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        let interfaces = dir.path().join("interfaces");
-        std::fs::write(&interfaces, HAND_FILE).unwrap();
-
-        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
+        let rig = rig("switch-heal-hand", false, false, Some(HAND_FILE));
+        std::fs::write(&rig.switch, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        let service = SwitchService::load(&rig.switch)
+            .with_interfaces_path(&rig.interfaces)
+            .with_net_class(net(rig.dir.path(), false, false))
+            .with_exec(rig.exec.clone());
         service.boot_apply().await.expect("nothing to run");
-        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), HAND_FILE);
+        assert_eq!(std::fs::read_to_string(&rig.interfaces).unwrap(), HAND_FILE);
         assert_eq!(service.view().await.running, document);
+        assert_eq!(rig.exec.ran(), Vec::<String>::new());
+    }
+
+    /// A bond the hand-written file made is not made a second time.
+    #[tokio::test]
+    async fn boot_heal_does_not_remake_a_bond_a_hand_written_file_made() {
+        let document = lag_flat();
+        let rig = rig("switch-heal-hand-bond", false, true, Some(HAND_FILE));
+        std::fs::write(&rig.switch, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        let service = SwitchService::load(&rig.switch)
+            .with_interfaces_path(&rig.interfaces)
+            .with_net_class(net(rig.dir.path(), false, true))
+            .with_exec(rig.exec.clone());
+        service.boot_apply().await.expect("heal");
+        assert!(!rig.exec.ran_any("link add bond0"), "{:#?}", rig.exec.ran());
+        assert_eq!(std::fs::read_to_string(&rig.interfaces).unwrap(), HAND_FILE);
     }
 
     const HAND_FILE: &str =
         "auto br0\niface br0 inet static\n  address 10.1.2.3\n  netmask 255.255.0.0\n";
+
+    /// A hand-written file whose address this daemon cannot read.
+    const HAND_FILE_UNREADABLE: &str = "auto br0\niface br0 inet manual\n  bridge-ports ge0\n";
 
     /// A pending change, as `apply` would leave it, without running the plan.
     async fn pending(service: &SwitchService, document: SwitchDocument) -> String {
@@ -854,53 +1347,129 @@ mod tests {
         token
     }
 
-    /// Without the opt-in, a hand-written file refuses the confirm and nothing
-    /// is persisted: the change stays pending and neither file is touched.
-    #[tokio::test]
-    async fn confirm_over_a_hand_written_file_without_the_opt_in_persists_nothing() {
-        let dir = tempdir::TempDir::new("switch-confirm-hand").expect("temp dir");
-        let switch_path = dir.path().join("switch.json");
-        let interfaces = dir.path().join("interfaces");
-        std::fs::write(&interfaces, HAND_FILE).unwrap();
-        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
-        let token = pending(&service, trunk()).await;
+    // ---- hand-written interfaces ------------------------------------------
 
-        let error = service.confirm(&token).await.expect_err("hand-written");
-        assert!(matches!(error, SwitchError::HandWritten(_)), "{error}");
-        assert!(service.view().await.pending.is_some(), "still pending");
-        assert!(!switch_path.exists(), "switch.json not written");
-        assert_eq!(std::fs::read_to_string(&interfaces).unwrap(), HAND_FILE);
+    /// Only LACP needs the file, so only LACP is held up by a hand-written
+    /// one: any other change is applied and confirmed, and the file is left as
+    /// the person wrote it, which is what happened before this daemon wrote it
+    /// at all.
+    #[tokio::test]
+    async fn a_hand_written_file_does_not_stand_in_the_way_of_a_change_that_is_not_lacp() {
+        let rig = rig("switch-hand-trunk", false, false, Some(HAND_FILE));
+        let pending = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("no opt-in is needed");
+        rig.service.confirm(&pending.token).await.expect("confirm");
+
+        assert_eq!(
+            std::fs::read_to_string(&rig.interfaces).unwrap(),
+            HAND_FILE,
+            "the hand-written file is not replaced"
+        );
+        assert!(
+            !rig.dir
+                .path()
+                .read_dir()
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(".hand-written.")),
+            "and so no copy of it is made"
+        );
+        assert_eq!(
+            SwitchService::load(&rig.switch).view().await.confirmed,
+            Some(trunk()),
+            "the document is persisted, as it always was"
+        );
     }
 
-    /// With the opt-in, confirm keeps a copy, writes the twin with the
-    /// address from the hand file, then `switch.json`, then commits.
+    /// LACP over a hand-written file is refused up front, before anything is
+    /// run, and the message names what a client can do about it.
     #[tokio::test]
-    async fn confirm_with_the_opt_in_keeps_a_copy_and_writes_both_files() {
-        let dir = tempdir::TempDir::new("switch-confirm-opt-in").expect("temp dir");
-        let switch_path = dir.path().join("switch.json");
-        let interfaces = dir.path().join("interfaces");
-        std::fs::write(&interfaces, HAND_FILE).unwrap();
-        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
-        let token = pending(&service, trunk()).await;
-        service.inner.lock().await.replaces_hand_written = true;
+    async fn lacp_over_a_hand_written_file_is_refused_and_says_how_to_go_ahead() {
+        let rig = rig("switch-hand-lag", false, false, Some(HAND_FILE));
+        let error = rig
+            .service
+            .apply(lag_flat(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("hand-written");
+        let SwitchError::HandWritten(message) = &error else {
+            panic!("expected HandWritten, got {error}");
+        };
+        assert!(message.contains("--replace-hand-written"), "{message}");
+        assert!(message.contains("replace_hand_written"), "{message}");
+        assert!(message.contains("interface"), "{message}");
+        assert!(rig.exec.ran().is_empty(), "nothing was run");
+        assert!(rig.service.view().await.pending.is_none());
+    }
 
-        service.confirm(&token).await.expect("confirm");
-        let view = service.view().await;
+    /// With the opt-in, LACP goes ahead; confirm keeps a copy, writes the
+    /// bond into the file with the address of the hand-written one, then
+    /// `switch.json`, then commits.
+    #[tokio::test]
+    async fn lacp_with_the_opt_in_keeps_a_copy_and_writes_both_files() {
+        let rig = rig("switch-hand-lag-ok", false, false, Some(HAND_FILE));
+        let pending = rig
+            .service
+            .apply(lag_flat(), DEFAULT_WINDOW, true)
+            .await
+            .expect("the opt-in is given");
+        rig.service.confirm(&pending.token).await.expect("confirm");
+
+        let view = rig.service.view().await;
         assert!(view.pending.is_none());
-        assert_eq!(view.confirmed, Some(trunk()));
-        let text = std::fs::read_to_string(&interfaces).unwrap();
-        assert_eq!(switch_from_header(&text), Some(trunk()));
+        assert_eq!(view.confirmed, Some(lag_flat()));
+        let text = std::fs::read_to_string(&rig.interfaces).unwrap();
+        assert_eq!(switch_from_header(&text), Some(lag_flat()));
         assert!(text.contains("address 10.1.2.3"), "{text}");
-        assert_eq!(
-            SwitchService::load(&switch_path).view().await.confirmed,
-            Some(trunk())
-        );
-        let copies: Vec<_> = std::fs::read_dir(dir.path())
+        assert!(text.contains("auto bond0"), "{text}");
+        let copies: Vec<_> = std::fs::read_dir(rig.dir.path())
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().contains(".hand-written."))
             .collect();
         assert_eq!(copies.len(), 1, "{copies:?}");
+    }
+
+    /// An address that cannot be read is not turned into DHCP: the board
+    /// would come back from the next boot on a different address.
+    #[tokio::test]
+    async fn an_address_that_cannot_be_read_is_refused_not_turned_into_dhcp() {
+        let rig = rig(
+            "switch-hand-unreadable",
+            false,
+            false,
+            Some(HAND_FILE_UNREADABLE),
+        );
+        let error = rig
+            .service
+            .apply(lag_flat(), DEFAULT_WINDOW, true)
+            .await
+            .expect_err("the address cannot be read");
+        let SwitchError::HandWritten(message) = &error else {
+            panic!("expected HandWritten, got {error}");
+        };
+        assert!(message.contains("cannot be read"), "{message}");
+        assert!(rig.exec.ran().is_empty(), "nothing was run");
+        assert_eq!(
+            std::fs::read_to_string(&rig.interfaces).unwrap(),
+            HAND_FILE_UNREADABLE
+        );
+    }
+
+    /// The same, if the file only turned hand-written after the apply: confirm
+    /// refuses and leaves everything as it was.
+    #[tokio::test]
+    async fn confirm_over_a_hand_written_file_without_the_opt_in_persists_nothing() {
+        let rig = rig("switch-confirm-hand", false, false, Some(HAND_FILE));
+        let token = pending(&rig.service, lag_trunk()).await;
+
+        let error = rig.service.confirm(&token).await.expect_err("hand-written");
+        assert!(matches!(error, SwitchError::HandWritten(_)), "{error}");
+        assert!(rig.service.view().await.pending.is_some(), "still pending");
+        assert!(!rig.switch.exists(), "switch.json not written");
+        assert_eq!(std::fs::read_to_string(&rig.interfaces).unwrap(), HAND_FILE);
     }
 
     /// A failed `interfaces` write leaves the change pending, writes no
@@ -913,8 +1482,10 @@ mod tests {
         // the write does not, so the write fails even for root.
         let interfaces = dir.path().join("i".repeat(230));
         std::fs::write(&interfaces, HAND_FILE).unwrap();
-        let service = SwitchService::load(&switch_path).with_interfaces_path(&interfaces);
-        let token = pending(&service, trunk()).await;
+        let service = SwitchService::load(&switch_path)
+            .with_interfaces_path(&interfaces)
+            .with_bond_executors(executor(dir.path()));
+        let token = pending(&service, lag_trunk()).await;
         service.inner.lock().await.replaces_hand_written = true;
 
         let error = service.confirm(&token).await.expect_err("the write fails");
@@ -930,6 +1501,230 @@ mod tests {
         assert!(
             names.iter().all(|n| !n.contains(".hand-written.")),
             "{names:?}"
+        );
+    }
+
+    // ---- confirm: one clock -----------------------------------------------
+
+    /// The check and the commit read one timestamp. A confirm at a moment
+    /// inside the window is honoured however long the writes in between took;
+    /// one past the ceiling is refused with nothing written.
+    #[tokio::test]
+    async fn confirm_judges_the_window_at_the_one_time_it_is_given() {
+        let rig = rig("switch-confirm-clock", false, false, None);
+        let pending = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("apply");
+
+        let late = pending.applied_at + DEFAULT_WINDOW + START_CEILING + Duration::from_secs(1);
+        let error = rig
+            .service
+            .confirm_at(&pending.token, late)
+            .await
+            .expect_err("past the ceiling");
+        assert!(
+            matches!(error, SwitchError::Change(ChangeError::NothingPending)),
+            "{error}"
+        );
+        assert!(!rig.switch.exists(), "nothing written for a late confirm");
+
+        let in_time = pending.applied_at + DEFAULT_WINDOW;
+        rig.service
+            .confirm_at(&pending.token, in_time)
+            .await
+            .expect("inside the window");
+        assert!(rig.switch.exists());
+    }
+
+    // ---- LACP apply, failure and undo -------------------------------------
+
+    /// A bond0 this daemon did not make is not created again, and nothing is
+    /// run: a failed attempt could otherwise take it down.
+    #[tokio::test]
+    async fn lacp_is_refused_while_a_bond0_that_is_not_ours_exists() {
+        let rig = rig("switch-bond-exists", false, true, None);
+        let error = rig
+            .service
+            .apply(lag_flat(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("bond0 exists");
+        let SwitchError::BondExists(message) = &error else {
+            panic!("expected BondExists, got {error}");
+        };
+        assert!(message.contains("did not create it"), "{message}");
+        assert!(rig.exec.ran().is_empty(), "{:#?}", rig.exec.ran());
+        assert!(rig.service.view().await.pending.is_none());
+    }
+
+    /// ...but a bond0 it did make (the running document is LACP) can be
+    /// reconfigured.
+    #[tokio::test]
+    async fn a_running_lacp_document_may_be_changed_with_its_bond_in_place() {
+        let rig = booted("switch-bond-running", &lag_flat(), false, true);
+        rig.service.boot_apply().await.expect("heal");
+        rig.service
+            .apply(lag_trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("bond0 is ours: it is the running document's");
+        assert!(!rig.exec.ran_any("link add bond0"), "{:#?}", rig.exec.ran());
+    }
+
+    /// The failed apply that never made the bond must not take one down.
+    #[tokio::test]
+    async fn a_failed_apply_that_never_made_the_bond_does_not_tear_one_down() {
+        let rig = rig("switch-undo-nobond", false, false, None);
+        rig.exec.fail("link add bond0");
+        let error = rig
+            .service
+            .apply(lag_flat(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("the bond cannot be made");
+        assert!(matches!(error, SwitchError::Command { .. }), "{error}");
+
+        assert!(
+            !rig.exec.ran_any("link delete bond0"),
+            "{:#?}",
+            rig.exec.ran()
+        );
+        assert!(!rig.exec.ran_any("nomaster"), "{:#?}", rig.exec.ran());
+        assert!(
+            rig.exec
+                .ran()
+                .iter()
+                .any(|c| c == "bridge vlan add dev ge0 vid 1 pvid untagged"),
+            "the VLANs the plan removed are put back: {:#?}",
+            rig.exec.ran()
+        );
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none());
+        assert_eq!(view.running, Preset::flat().expand());
+    }
+
+    /// The failed apply that did make it, and then failed, takes it down.
+    #[tokio::test]
+    async fn a_failed_apply_that_made_the_bond_takes_it_down_again() {
+        let rig = rig("switch-undo-bond", false, false, None);
+        rig.exec.fail("dev ge1 master bond0");
+        let error = rig
+            .service
+            .apply(lag_flat(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("ge1 cannot join");
+        assert!(matches!(error, SwitchError::Command { .. }), "{error}");
+        assert!(
+            rig.exec.ran_any("link delete bond0"),
+            "{:#?}",
+            rig.exec.ran()
+        );
+        assert!(
+            rig.exec
+                .ran()
+                .contains(&"ip link set dev ge0 master br0".to_string()),
+            "{:#?}",
+            rig.exec.ran()
+        );
+    }
+
+    // ---- the timer and the revert path ------------------------------------
+
+    /// An uplink that never forwards is put back at the ceiling, through the
+    /// same path the timer uses, and the window never having started is not
+    /// a reason to wait for ever.
+    #[tokio::test]
+    async fn an_uplink_that_never_forwards_is_reverted_by_the_timer_at_the_ceiling() {
+        let rig = rig("switch-timer", false, false, None);
+        let pending = rig
+            .service
+            .apply(lag_trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("apply");
+        assert_eq!(rig.service.view().await.running, lag_trunk());
+
+        // Inside the ceiling: waiting on an uplink that has not come up.
+        rig.service
+            .tick_at(pending.applied_at + DEFAULT_WINDOW + Duration::from_secs(59))
+            .await;
+        assert!(rig.service.view().await.pending.is_some());
+
+        rig.exec.forget();
+        rig.service
+            .tick_at(pending.applied_at + DEFAULT_WINDOW + START_CEILING)
+            .await;
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none(), "put back");
+        assert_eq!(
+            view.last_revert.map(|r| r.reason),
+            Some(crate::app::switch_change::RevertReason::NotConfirmed)
+        );
+        assert_eq!(view.running, Preset::flat().expand());
+        assert!(
+            rig.exec.ran_any("link delete bond0"),
+            "{:#?}",
+            rig.exec.ran()
+        );
+    }
+
+    /// Flat to LACP and a revert back, and again: each trip does what the
+    /// first did, and the document the board reports is the one it holds.
+    #[tokio::test]
+    async fn lag_then_flat_then_lag_again_goes_through_the_service() {
+        let rig = rig("switch-roundtrip", false, false, None);
+        for trip in 0..2 {
+            rig.service
+                .apply(lag_trunk(), DEFAULT_WINDOW, false)
+                .await
+                .unwrap_or_else(|e| panic!("trip {trip}: {e}"));
+            assert_eq!(rig.service.view().await.running, lag_trunk());
+            rig.service.revert().await.expect("revert");
+            assert_eq!(rig.service.view().await.running, Preset::flat().expand());
+        }
+        let made = rig
+            .exec
+            .ran()
+            .iter()
+            .filter(|c| c.starts_with("ip link add bond0"))
+            .count();
+        assert_eq!(made, 2, "{:#?}", rig.exec.ran());
+    }
+
+    /// A revert that meets a failure goes on with the rest instead of leaving
+    /// the ports half-moved, and what it reports as running is what the kernel
+    /// says, not what it meant.
+    #[tokio::test]
+    async fn a_revert_carries_on_past_a_failure_and_reports_what_the_kernel_holds() {
+        let rig = rig("switch-revert-best-effort", true, false, None);
+        rig.service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("apply");
+
+        rig.exec.fail("bridge vlan del dev ge0 vid 10");
+        // After the revert the bridge is not filtering, and ge0 kept VLAN 10.
+        std::fs::write(rig.dir.path().join("net/br0/bridge/vlan_filtering"), "0\n").unwrap();
+        rig.exec.set_vlans(
+            r#"[{"ifname":"ge0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":10}]}]"#,
+        );
+        rig.exec.forget();
+
+        let error = rig.service.revert().await.expect_err("one step fails");
+        assert!(matches!(error, SwitchError::Command { .. }), "{error}");
+        assert!(
+            rig.exec
+                .ran()
+                .contains(&"bridge vlan add dev ge1 vid 1 pvid untagged".to_string()),
+            "the steps after the failure still ran: {:#?}",
+            rig.exec.ran()
+        );
+        let running = rig.service.view().await.running;
+        assert!(!running.vlan_filtering);
+        assert_eq!(
+            running.ports[&PortId::Ge0],
+            crate::app::switch_document::PortConfig {
+                untagged: Some(1),
+                tagged: [10].into_iter().collect()
+            }
         );
     }
 }

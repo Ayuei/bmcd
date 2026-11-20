@@ -70,7 +70,7 @@ struct PresetView {
 /// What `validate` will accept: a preset to expand, or a document outright.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum Proposal {
+pub(crate) enum Proposal {
     Preset(Preset),
     Document(SwitchDocument),
 }
@@ -214,14 +214,16 @@ async fn post_validate(
 }
 
 #[derive(Debug, Deserialize)]
-struct ApplyRequest {
+pub(crate) struct ApplyRequest {
     #[serde(flatten)]
     proposal: Proposal,
     /// Seconds to wait for a confirmation. Absent means the board's default.
     #[serde(default)]
     window_s: Option<u64>,
-    /// Say yes to replacing an `interfaces` file somebody wrote by hand. The
-    /// confirmed change keeps a copy of it first.
+    /// Say yes to replacing an `interfaces` file somebody wrote by hand. Asked
+    /// for only when the change is LACP, which needs `bond0` declared in that
+    /// file; every other change leaves a hand-written file alone and never
+    /// needs this. The confirmed change keeps a copy of the file first.
     #[serde(default)]
     replace_hand_written: bool,
 }
@@ -264,7 +266,7 @@ fn refuse(e: SwitchError) -> LegacyResponse {
         SwitchError::Change(_) | SwitchError::MissingBondExecutor(_) => {
             LegacyResponse::bad_request(e.to_string())
         }
-        SwitchError::NoBridge(_) | SwitchError::HandWritten(_) => {
+        SwitchError::NoBridge(_) | SwitchError::HandWritten(_) | SwitchError::BondExists(_) => {
             LegacyResponse::Error(actix_web::http::StatusCode::CONFLICT, e.to_string().into())
         }
         other => LegacyResponse::from(anyhow::anyhow!("{other}")),

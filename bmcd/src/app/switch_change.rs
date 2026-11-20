@@ -40,6 +40,10 @@
 //! reports forwarding. With no spanning tree in play there is nothing to wait
 //! for and it starts at once.
 //!
+//! An uplink that never forwards must not leave the board stranded either, so
+//! there is a ceiling: a change whose uplink has not forwarded within
+//! `window_s + `[`START_CEILING`] of being applied is put back anyway.
+//!
 //! ## Only a confirmed document is ever persisted
 //!
 //! A reboot during the window comes back on the previous confirmed document,
@@ -66,6 +70,19 @@ use std::time::{Duration, SystemTime};
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(30);
 pub const MIN_WINDOW: Duration = Duration::from_secs(10);
 pub const MAX_WINDOW: Duration = Duration::from_secs(300);
+
+/// How long past the window an uplink may take to start forwarding before the
+/// change is put back anyway.
+///
+/// The countdown only starts once the uplink forwards. An uplink that never
+/// does (an uncabled port, a switch with no LACP on the other end, a bond that
+/// never negotiates) would otherwise leave the window not running for ever, the
+/// board off the network, and nothing to put it back: a power cycle would be
+/// the only way out. So a change whose uplink has not forwarded within
+/// `window_s + START_CEILING` of being applied is reverted as if it had not
+/// been confirmed. The extra minute is spanning tree's forwarding delay and a
+/// slow LACP negotiation, with room to spare.
+pub const START_CEILING: Duration = Duration::from_secs(60);
 
 /// Why a pending change went back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -115,8 +132,18 @@ impl Pending {
             .map(|from| from + Duration::from_secs(self.window_s))
     }
 
+    /// The latest moment this change is put back when its window never starts:
+    /// the uplink has not forwarded by then, so nobody could have reached the
+    /// board to confirm it. See [`START_CEILING`].
+    pub fn ceiling(&self) -> SystemTime {
+        self.applied_at + Duration::from_secs(self.window_s) + START_CEILING
+    }
+
     fn expired_at(&self, now: SystemTime) -> bool {
-        self.deadline().is_some_and(|deadline| now >= deadline)
+        match self.deadline() {
+            Some(deadline) => now >= deadline,
+            None => now >= self.ceiling(),
+        }
     }
 }
 
@@ -248,7 +275,6 @@ impl SwitchState {
         }
     }
 
-    /// Keep the change. Only now is anything written down.
     /// What a confirmation with this token would persist, changing nothing.
     ///
     /// Confirming writes two files, so it is check, write, and only then
@@ -274,6 +300,7 @@ impl SwitchState {
         Ok(pending.document.clone())
     }
 
+    /// Keep the change. Only now is anything written down.
     pub fn confirm(&mut self, token: &str, now: SystemTime) -> Result<Effect, ChangeError> {
         let document = self.check_confirm(token, now)?;
         self.confirmed = Some(document.clone());
@@ -354,8 +381,8 @@ mod tests {
         assert_eq!(pending.counting_from, None);
         assert_eq!(pending.deadline(), None);
 
-        // Well past the window, measured from the apply.
-        let long_after = t0() + Duration::from_secs(600);
+        // Past the window, measured from the apply, but inside the ceiling.
+        let long_after = t0() + DEFAULT_WINDOW + Duration::from_secs(30);
         assert_eq!(
             state.tick(long_after),
             Effect::None,
@@ -370,6 +397,59 @@ mod tests {
             state.tick(long_after + DEFAULT_WINDOW),
             Effect::Apply(flat()),
             "the window should run from forwarding"
+        );
+    }
+
+    /// The safety net for an uplink that never forwards: no cable, no LACP on
+    /// the far side, a bond that never negotiates. Without a ceiling the window
+    /// would never start and nothing would put the old document back.
+    #[test]
+    fn an_uplink_that_never_forwards_is_reverted_at_the_ceiling() {
+        let mut state = SwitchState::default();
+        let pending = applied(&mut state, t0());
+        let ceiling = t0() + DEFAULT_WINDOW + START_CEILING;
+        assert_eq!(pending.ceiling(), ceiling);
+
+        // One second before: still waiting for the uplink.
+        assert_eq!(state.tick(ceiling - Duration::from_secs(1)), Effect::None);
+        assert!(state.pending().is_some());
+
+        // At the ceiling: put back, and say why.
+        assert_eq!(state.tick(ceiling), Effect::Apply(flat()));
+        assert!(state.pending().is_none());
+        let record = state.last_revert().expect("the revert is recorded");
+        assert_eq!(record.reason, RevertReason::NotConfirmed);
+        assert_eq!(record.document, trunk());
+    }
+
+    /// A confirm after the ceiling is refused, like one after the deadline:
+    /// by then the board has put the old document back.
+    #[test]
+    fn a_confirm_after_the_ceiling_is_refused() {
+        let mut state = SwitchState::default();
+        applied(&mut state, t0());
+        let late = t0() + DEFAULT_WINDOW + START_CEILING;
+        assert_eq!(
+            state.check_confirm("tok", late),
+            Err(ChangeError::NothingPending)
+        );
+    }
+
+    /// Once the uplink has forwarded the ceiling no longer applies: the
+    /// window runs from forwarding, however late that was.
+    #[test]
+    fn the_ceiling_does_not_apply_once_the_window_is_counting() {
+        let mut state = SwitchState::default();
+        applied(&mut state, t0());
+        let forwarding_at = t0() + DEFAULT_WINDOW + START_CEILING - Duration::from_secs(1);
+        state.uplink_forwarding(forwarding_at);
+        assert_eq!(
+            state.tick(forwarding_at + Duration::from_secs(5)),
+            Effect::None
+        );
+        assert_eq!(
+            state.tick(forwarding_at + DEFAULT_WINDOW),
+            Effect::Apply(flat())
         );
     }
 
