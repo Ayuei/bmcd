@@ -14,7 +14,7 @@
 //! Routes for legacy API present in versions <= 2.0.0 of the firmware.
 use crate::api::into_legacy_response::LegacyResponse;
 use crate::api::into_legacy_response::{LegacyResult, Null};
-use crate::app::bmc_application::NodeInfo;
+use crate::app::bmc_application::NodeInfoUpdate;
 use crate::app::bmc_application::{BmcApplication, UsbConfig};
 use crate::app::bmc_info::{get_fs_stat, get_net_interfaces, get_primary_info, get_storage_info};
 use crate::app::firmware_catalog;
@@ -739,7 +739,7 @@ fn get_node_info(_bmc: &BmcApplication) -> impl Into<LegacyResponse> {
 }
 async fn set_node_aux_info(
     bmc: web::Data<BmcApplication>,
-    payload: web::Json<HashMap<NodeId, NodeInfo>>,
+    payload: web::Json<HashMap<NodeId, NodeInfoUpdate>>,
 ) -> impl Responder {
     bmc.set_node_info(payload.into_inner()).await?;
     Ok::<Null, LegacyResponse>(Null)
@@ -1972,8 +1972,8 @@ mod test {
                 }
             }
         };
-        let infos: HashMap<NodeId, NodeInfo> = serde_json::from_value(json).unwrap();
-        assert_eq!(infos[&NodeId::Node2].uart_baud, Some(1_500_000));
+        let infos: HashMap<NodeId, NodeInfoUpdate> = serde_json::from_value(json).unwrap();
+        assert_eq!(infos[&NodeId::Node2].uart_baud, Some(Some(1_500_000)));
         assert_eq!(infos[&NodeId::Node1].uart_baud, None);
     }
 
