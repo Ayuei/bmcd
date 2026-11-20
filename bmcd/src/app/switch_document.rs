@@ -75,10 +75,11 @@ pub const MAX_VLAN_NAME: usize = 32;
 
 /// A port of the on-board switch.
 ///
-/// Seven, not the six with netdevs. The BMC's own port has no interface in
-/// `/sys/class/net` -- it is the CPU port -- but it is the one port whose
-/// configuration can strand the board, so a document that could not name it
-/// would be a document that could not be checked.
+/// Seven physical ports in [`PortId::ALL`], plus optional [`PortId::Bond0`]
+/// when LACP is on. The BMC's own port has no interface in `/sys/class/net`
+/// -- it is the CPU port -- but it is the one port whose configuration can
+/// strand the board, so a document that could not name it would be a document
+/// that could not be checked.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -92,11 +93,15 @@ pub enum PortId {
     Bmc,
     Ge0,
     Ge1,
+    /// LACP bond over ge0+ge1 when [`SecondUplink::Lag`]. Not a DSA port; a
+    /// Linux bonding netdev enslaved to the bridge. Present in `ports` only
+    /// while lag is on — not listed in [`PortId::ALL`].
+    Bond0,
 }
 
 impl PortId {
-    /// Every port, in the order a person reads the board: modules, then the
-    /// BMC, then the uplinks.
+    /// Every physical port, in the order a person reads the board: modules,
+    /// then the BMC, then the uplinks. Excludes [`PortId::Bond0`].
     pub const ALL: [PortId; 7] = [
         PortId::Node1,
         PortId::Node2,
@@ -108,7 +113,7 @@ impl PortId {
     ];
 
     pub fn is_uplink(self) -> bool {
-        matches!(self, PortId::Ge0 | PortId::Ge1)
+        matches!(self, PortId::Ge0 | PortId::Ge1 | PortId::Bond0)
     }
 
     pub fn is_node(self) -> bool {
@@ -128,6 +133,7 @@ impl PortId {
             PortId::Bmc => "the BMC's own port",
             PortId::Ge0 => "ge0",
             PortId::Ge1 => "ge1",
+            PortId::Bond0 => "bond0",
         }
     }
 }
@@ -149,7 +155,7 @@ pub struct PortConfig {
 }
 
 impl PortConfig {
-    fn untagged(vid: u16) -> Self {
+    pub(crate) fn untagged(vid: u16) -> Self {
         PortConfig {
             untagged: Some(vid),
             tagged: BTreeSet::new(),
@@ -176,7 +182,11 @@ impl PortConfig {
 }
 
 /// The whole switch, as one object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// Deserialised by hand, below, so that a missing `second_uplink` means the
+/// same thing wherever the document comes from: see [`SwitchDocument`]'s
+/// `Deserialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SwitchDocument {
     /// False is `Flat`: the switch forwards without looking at VLANs and the
     /// port table below is inert. Kept in the document rather than implied by
@@ -184,6 +194,15 @@ pub struct SwitchDocument {
     /// things to the hardware, and only one of them is what a board ships as.
     pub vlan_filtering: bool,
     pub stp: bool,
+    /// How ge0/ge1 relate: STP redundancy, second cable off, or LACP bond0.
+    ///
+    /// Older files and older clients omit the field. Reading a document
+    /// without it infers it from the ports and STP rather than defaulting
+    /// everything to Redundant — a Split or a Trunk with ge1 off would
+    /// otherwise disagree with its own preset. One rule for every way in: the
+    /// file, the `interfaces` header and an API body all read it the same.
+    #[serde(default)]
+    pub second_uplink: SecondUplink,
     pub ports: BTreeMap<PortId, PortConfig>,
     /// What the operator calls each VLAN. A word beside a number, so that a
     /// layout is still legible to whoever opens this board next year.
@@ -210,6 +229,38 @@ pub struct SwitchDocument {
     pub names: BTreeMap<u16, String>,
 }
 
+impl<'de> Deserialize<'de> for SwitchDocument {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The document as it is on the wire, where `second_uplink` may be
+        /// missing.
+        #[derive(Deserialize)]
+        struct Wire {
+            vlan_filtering: bool,
+            stp: bool,
+            #[serde(default)]
+            second_uplink: Option<SecondUplink>,
+            ports: BTreeMap<PortId, PortConfig>,
+            #[serde(default, deserialize_with = "names_from_wire")]
+            names: BTreeMap<u16, String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut document = SwitchDocument {
+            vlan_filtering: wire.vlan_filtering,
+            stp: wire.stp,
+            second_uplink: SecondUplink::Redundant,
+            ports: wire.ports,
+            names: wire.names,
+        };
+        document.second_uplink = wire
+            .second_uplink
+            .unwrap_or_else(|| infer_second_uplink(&document));
+        Ok(document)
+    }
+}
+
 /// `names` as it is on the wire: an object whose keys are VLAN ids written as
 /// strings. Parsed here so it reads the same whether serde got here directly
 /// or through a buffering (`untagged`) path. A key that is not a number is a
@@ -234,7 +285,7 @@ where
         .collect()
 }
 
-/// Which uplink arrangement `Trunk` uses for ge1.
+/// Which uplink arrangement the document uses for ge0/ge1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SecondUplink {
@@ -245,6 +296,9 @@ pub enum SecondUplink {
     Redundant,
     /// ge1 in no VLAN: present, and carrying nothing.
     Off,
+    /// ge0 and ge1 enslaved to `bond0` (802.3ad); the bond is the uplink face.
+    /// Mutually exclusive with STP redundancy on two independent uplinks.
+    Lag,
 }
 
 /// A named document.
@@ -252,14 +306,20 @@ pub enum SecondUplink {
 #[serde(tag = "preset", rename_all = "lowercase")]
 pub enum Preset {
     /// One bridge, no filtering. What a board ships as, and the reset target.
-    Flat,
+    /// `second_uplink: lag` is flat+LACP (`bond0`); other values keep ge0+ge1
+    /// on the bridge as today. `{"preset":"flat"}` still deserializes.
+    Flat {
+        #[serde(default)]
+        second_uplink: SecondUplink,
+    },
     /// Two groups that never meet, and nothing tagged leaves the board: the
     /// BMC out of ge0, the modules out of ge1. For someone with two switch
-    /// ports and no VLAN configuration on the other end.
+    /// ports and no VLAN configuration on the other end. Incompatible with LAG.
     Split,
     /// One cable carrying both, tagged, for a router that knows the VLANs.
     /// The identifiers are the operator's, because the router has to match
-    /// them and only they know what is free.
+    /// them and only they know what is free. `second_uplink: lag` trunks on
+    /// `bond0` instead of ge0 (and optionally ge1).
     Trunk {
         management_vid: u16,
         node_vid: u16,
@@ -269,17 +329,33 @@ pub enum Preset {
 }
 
 impl Preset {
+    /// Stock Flat: both uplinks on `br0`, no filtering, no LAG.
+    pub const fn flat() -> Self {
+        Preset::Flat {
+            second_uplink: SecondUplink::Redundant,
+        }
+    }
+
     /// The document this preset means.
     pub fn expand(self) -> SwitchDocument {
         let mut ports = BTreeMap::new();
         match self {
-            Preset::Flat => {
+            Preset::Flat { second_uplink } => {
+                let lag = matches!(second_uplink, SecondUplink::Lag);
                 for port in PortId::ALL {
-                    ports.insert(port, PortConfig::untagged(FLAT_VID));
+                    let config = match (lag, port) {
+                        (true, PortId::Ge0 | PortId::Ge1) => PortConfig::none(),
+                        _ => PortConfig::untagged(FLAT_VID),
+                    };
+                    ports.insert(port, config);
+                }
+                if lag {
+                    ports.insert(PortId::Bond0, PortConfig::untagged(FLAT_VID));
                 }
                 SwitchDocument {
                     vlan_filtering: false,
                     stp: false,
+                    second_uplink,
                     ports,
                     // Nothing to name: filtering is off, so there is one
                     // network and it is the only one there has ever been.
@@ -302,6 +378,7 @@ impl Preset {
                     // cost a forwarding delay on every link change and prevent
                     // nothing.
                     stp: false,
+                    second_uplink: SecondUplink::Off,
                     ports,
                     // Deliberately unnamed. Under Split no tag leaves the
                     // board, so 4093 and 4094 are invisible to the router and
@@ -315,26 +392,30 @@ impl Preset {
                 node_vid,
                 second_uplink,
             } => {
+                let lag = matches!(second_uplink, SecondUplink::Lag);
+                let uplink = PortConfig::tagged(&[management_vid, node_vid]);
                 for port in PortId::ALL {
                     let config = match port {
                         PortId::Bmc => PortConfig::untagged(management_vid),
-                        PortId::Ge0 => PortConfig::tagged(&[management_vid, node_vid]),
+                        PortId::Ge0 | PortId::Ge1 if lag => PortConfig::none(),
+                        PortId::Ge0 => uplink.clone(),
                         PortId::Ge1 => match second_uplink {
-                            SecondUplink::Redundant => {
-                                PortConfig::tagged(&[management_vid, node_vid])
-                            }
-                            SecondUplink::Off => PortConfig::none(),
+                            SecondUplink::Redundant => uplink.clone(),
+                            SecondUplink::Off | SecondUplink::Lag => PortConfig::none(),
                         },
                         _ => PortConfig::untagged(node_vid),
                     };
                     ports.insert(port, config);
                 }
+                if lag {
+                    ports.insert(PortId::Bond0, uplink);
+                }
                 SwitchDocument {
                     vlan_filtering: true,
-                    // Both uplinks carrying the same VLANs is a loop unless
-                    // something breaks it. That is the refusal below, made
-                    // true here.
+                    // Both independent uplinks carrying the same VLANs is a
+                    // loop unless STP breaks it. LAG is one logical uplink.
                     stp: matches!(second_uplink, SecondUplink::Redundant),
+                    second_uplink,
                     ports,
                     // Named, unlike the other two presets, because these are
                     // the numbers the operator chose and has to match on the
@@ -349,6 +430,20 @@ impl Preset {
                 }
             }
         }
+    }
+}
+
+/// Recover `second_uplink` for files written before the field existed.
+pub(crate) fn infer_second_uplink(document: &SwitchDocument) -> SecondUplink {
+    if document.ports.contains_key(&PortId::Bond0) {
+        SecondUplink::Lag
+    } else if document.stp {
+        SecondUplink::Redundant
+    } else if document.vlan_filtering {
+        // Split and Trunk-with-ge1-off both expand with Off.
+        SecondUplink::Off
+    } else {
+        SecondUplink::Redundant
     }
 }
 
@@ -375,6 +470,18 @@ pub struct Warning {
 }
 
 impl SwitchDocument {
+    /// Load a persisted document. `second_uplink` is inferred when the field
+    /// is absent, so pre-LAG files keep matching their presets: the same rule
+    /// as for an API body, because both go through the one `Deserialize`.
+    pub fn from_json_slice(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+
+    /// Same as [`from_json_slice`](Self::from_json_slice) for a header line.
+    pub fn from_json_str(text: &str) -> Option<Self> {
+        serde_json::from_str(text).ok()
+    }
+
     /// Which ports are in `vid`, tagged or untagged.
     pub fn members(&self, vid: u16) -> BTreeSet<PortId> {
         self.ports
@@ -450,9 +557,45 @@ impl SwitchDocument {
             }
         }
 
+        if self.second_uplink == SecondUplink::Lag {
+            if self.stp {
+                return Some(Refusal::new(
+                    "LACP and spanning-tree redundancy are different ways to use two uplinks; \
+                     turn spanning tree off when bond0 carries them.",
+                ));
+            }
+            let ge0 = self.ports.get(&PortId::Ge0).cloned().unwrap_or_default();
+            let ge1 = self.ports.get(&PortId::Ge1).cloned().unwrap_or_default();
+            if !ge0.vlans().is_empty() || !ge1.vlans().is_empty() {
+                return Some(Refusal::new(
+                    "with LACP, ge0 and ge1 are bond slaves and must carry no VLANs of their \
+                     own; put the uplink VLANs on bond0.",
+                ));
+            }
+            match self.ports.get(&PortId::Bond0) {
+                None => {
+                    return Some(Refusal::new(
+                        "LACP is on but bond0 is missing from the port table.",
+                    ));
+                }
+                Some(bond) if bond.vlans().is_empty() && self.vlan_filtering => {
+                    return Some(Refusal::new(
+                        "bond0 would carry no VLANs, so nothing could leave this board on the \
+                         uplink.",
+                    ));
+                }
+                Some(_) => {}
+            }
+        } else if self.ports.contains_key(&PortId::Bond0) {
+            return Some(Refusal::new(
+                "bond0 is in the port table but LACP is off. Remove bond0, or set the second \
+                 uplink to lag.",
+            ));
+        }
+
         // Filtering off is one bridge. None of what follows can be true, and
         // checking the inert table would refuse documents that describe
-        // nothing.
+        // nothing — except the LAG shape checks above, which still apply.
         if !self.vlan_filtering {
             return None;
         }
@@ -513,7 +656,15 @@ impl SwitchDocument {
             return warnings;
         }
 
-        for port in PortId::ALL {
+        let lag = self.second_uplink == SecondUplink::Lag;
+        // With LACP, ge0 and ge1 are bond slaves: empty on purpose, and not
+        // bridge ports at all. The bond is the uplink, so it is the one asked
+        // about instead.
+        let ports = PortId::ALL
+            .into_iter()
+            .filter(|port| !(lag && matches!(port, PortId::Ge0 | PortId::Ge1)))
+            .chain(lag.then_some(PortId::Bond0));
+        for port in ports {
             let config = self.ports.get(&port).cloned().unwrap_or_default();
             if config.vlans().is_empty() {
                 warnings.push(Warning {
@@ -570,7 +721,7 @@ mod tests {
     #[test]
     fn every_preset_passes_the_rules_it_is_checked_against() {
         for preset in [
-            Preset::Flat,
+            Preset::flat(),
             Preset::Split,
             trunk(),
             Preset::Trunk {
@@ -591,7 +742,7 @@ mod tests {
 
     #[test]
     fn every_preset_names_all_seven_ports() {
-        for preset in [Preset::Flat, Preset::Split, trunk()] {
+        for preset in [Preset::flat(), Preset::Split, trunk()] {
             let document = preset.expand();
             assert_eq!(
                 document.ports.len(),
@@ -637,6 +788,16 @@ mod tests {
     }
 
     #[test]
+    fn older_json_without_second_uplink_infers_split_as_off() {
+        let split = Preset::Split.expand();
+        let mut value = serde_json::to_value(&split).unwrap();
+        value.as_object_mut().unwrap().remove("second_uplink");
+        let loaded = serde_json::from_value::<SwitchDocument>(value).expect("load");
+        assert_eq!(loaded.second_uplink, SecondUplink::Off);
+        assert_eq!(loaded, split);
+    }
+
+    #[test]
     fn trunk_with_the_second_uplink_off_leaves_ge1_carrying_nothing() {
         let d = Preset::Trunk {
             management_vid: 10,
@@ -649,6 +810,43 @@ mod tests {
             !d.stp,
             "there is no loop to break, so no forwarding delay to pay"
         );
+    }
+
+    #[test]
+    fn trunk_lag_puts_vlans_on_bond0_and_empties_ge_ports() {
+        let d = Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        assert_eq!(d.second_uplink, SecondUplink::Lag);
+        assert!(!d.stp);
+        assert!(d.ports[&PortId::Ge0].vlans().is_empty());
+        assert!(d.ports[&PortId::Ge1].vlans().is_empty());
+        assert_eq!(d.ports[&PortId::Bond0], PortConfig::tagged(&[10, 20]));
+        assert_eq!(d.refusal(), None);
+    }
+
+    #[test]
+    fn flat_lag_is_accepted() {
+        let d = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        assert_eq!(d.refusal(), None);
+        assert!(d.ports.contains_key(&PortId::Bond0));
+    }
+
+    #[test]
+    fn lag_with_vlans_still_on_ge0_is_refused() {
+        let mut d = Preset::Flat {
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        d.ports.insert(PortId::Ge0, PortConfig::untagged(1));
+        let refusal = d.refusal().expect("slaves must be empty");
+        assert!(refusal.reason.contains("bond slaves"), "{refusal:?}");
     }
 
     /// The refusal this whole module exists for.
@@ -742,7 +940,7 @@ mod tests {
     /// table is inert and must not be judged as though filtering were on.
     #[test]
     fn flat_is_never_refused_whatever_its_table_says() {
-        let mut d = Preset::Flat.expand();
+        let mut d = Preset::flat().expand();
         d.ports.insert(PortId::Bmc, PortConfig::none());
         assert_eq!(
             d.refusal(),
@@ -879,9 +1077,98 @@ mod tests {
         assert!(d.names.is_empty());
     }
 
+    /// One rule for a missing `second_uplink`, whichever way the document
+    /// comes in: a file on the overlay, the header of `interfaces`, or an API
+    /// body (which reaches serde through the buffering `untagged` Proposal
+    /// enum). Each of the shapes a board is actually in.
+    #[test]
+    fn a_document_without_second_uplink_reads_the_same_from_a_file_and_an_api_body() {
+        let shapes = [
+            Preset::flat(),
+            Preset::Flat {
+                second_uplink: SecondUplink::Lag,
+            },
+            Preset::Split,
+            trunk(),
+            Preset::Trunk {
+                management_vid: 10,
+                node_vid: 20,
+                second_uplink: SecondUplink::Off,
+            },
+            Preset::Trunk {
+                management_vid: 10,
+                node_vid: 20,
+                second_uplink: SecondUplink::Lag,
+            },
+        ];
+        for preset in shapes {
+            let document = preset.expand();
+            let mut value = serde_json::to_value(&document).unwrap();
+            value.as_object_mut().unwrap().remove("second_uplink");
+            let text = serde_json::to_string(&value).unwrap();
+
+            let from_file = SwitchDocument::from_json_slice(text.as_bytes()).expect("file");
+            let from_header = SwitchDocument::from_json_str(&text).expect("header");
+            let from_body: SwitchDocument = serde_json::from_str(&text).expect("body");
+            assert_eq!(from_file, from_body, "{preset:?}");
+            assert_eq!(from_header, from_body, "{preset:?}");
+            // And it is the document the preset meant: the field was not
+            // needed to know what it is.
+            assert_eq!(from_body, document, "{preset:?}");
+        }
+    }
+
+    /// A field that is there wins over any inference.
+    #[test]
+    fn a_second_uplink_that_is_given_is_not_inferred_over() {
+        let mut value = serde_json::to_value(trunk().expand()).unwrap();
+        value["second_uplink"] = serde_json::json!("off");
+        let d: SwitchDocument = serde_json::from_value(value).unwrap();
+        assert_eq!(d.second_uplink, SecondUplink::Off);
+    }
+
+    /// The warnings for a LAG document talk about bond0, not about the two
+    /// slaves that are empty by design.
+    #[test]
+    fn lag_warnings_skip_the_slaves_and_ask_about_the_bond() {
+        let d = Preset::Trunk {
+            management_vid: 10,
+            node_vid: 20,
+            second_uplink: SecondUplink::Lag,
+        }
+        .expand();
+        let warned: Vec<Option<PortId>> = d.warnings().iter().map(|w| w.port).collect();
+        assert!(!warned.contains(&Some(PortId::Ge0)), "{warned:?}");
+        assert!(!warned.contains(&Some(PortId::Ge1)), "{warned:?}");
+
+        // With nothing on bond0 the bond is what is flagged.
+        let mut empty = d.clone();
+        empty.ports.insert(PortId::Bond0, PortConfig::none());
+        let warned: Vec<Option<PortId>> = empty.warnings().iter().map(|w| w.port).collect();
+        assert!(warned.contains(&Some(PortId::Bond0)), "{warned:?}");
+
+        // A document that is not LAG still warns about an empty ge0.
+        let mut plain = trunk().expand();
+        plain.ports.insert(PortId::Ge0, PortConfig::none());
+        let warned: Vec<Option<PortId>> = plain.warnings().iter().map(|w| w.port).collect();
+        assert!(warned.contains(&Some(PortId::Ge0)), "{warned:?}");
+    }
+
     #[test]
     fn a_preset_round_trips_through_json() {
-        for preset in [Preset::Flat, Preset::Split, trunk()] {
+        for preset in [
+            Preset::flat(),
+            Preset::Flat {
+                second_uplink: SecondUplink::Lag,
+            },
+            Preset::Split,
+            trunk(),
+            Preset::Trunk {
+                management_vid: 10,
+                node_vid: 20,
+                second_uplink: SecondUplink::Lag,
+            },
+        ] {
             let json = serde_json::to_string(&preset).expect("serialise");
             let back: Preset = serde_json::from_str(&json).expect("deserialise");
             assert_eq!(preset, back, "{json}");
