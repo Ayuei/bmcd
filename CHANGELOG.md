@@ -10,6 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [2.46.0] — 2026-11-20
+
+A reboot of the BMC on the 6.18 kernel is no longer read as a cold boot.
+
+The fix reads the latch shadow word that the kernel's gpio-latch patch keeps in
+SoC SRAM, the cooperative contract with the bootloader that
+[@danste22](https://github.com/danste22) carried to 6.18 (with the original
+idea from Sven Rademakers, whose 2024 patch in turing-machines/BMC-Firmware
+started it). Thanks to both.
+
 ### Fixed
 
 - **A reboot of the BMC on the 6.18 kernel no longer reads as a cold boot.**
