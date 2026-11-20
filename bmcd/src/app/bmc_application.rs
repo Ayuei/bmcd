@@ -318,10 +318,12 @@ impl BmcApplication {
 
     /// Applies the node power state on start of the daemon. A restart of the
     /// daemon, or a reboot of the BMC, must not interfere with nodes that are
-    /// running: on a latching board the kernel preserves the node enable
-    /// latches, so when any of them reads on, that live state is the truth and
-    /// the persisted state is updated to match. Only when all of them read off
-    /// (a cold boot) the persisted state is restored.
+    /// running: on a latching board the node power latches outlive a reboot of
+    /// the BMC, so when any node reads powered, that live state is the truth
+    /// and the persisted state is updated to match. Only when all of them read
+    /// off (a cold boot, which clears the latches) the persisted state is
+    /// restored. See [`PowerController::get_power_node`] for where the live
+    /// state comes from.
     async fn initialize_power(&self) -> anyhow::Result<()> {
         let persisted = self.app_db.try_get::<u8>(ACTIVATED_NODES_KEY).await?;
         let live = self.power_controller.get_power_node().unwrap_or_else(|e| {
