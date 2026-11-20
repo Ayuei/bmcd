@@ -10,10 +10,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Thanks to [@danste22](https://github.com/danste22) for LACP, in
-[#50](https://github.com/excavador-turing/bmcd/pull/50), carried on as
-[#56](https://github.com/excavador-turing/bmcd/pull/56). His original commits
-are kept in this branch, with their author.
+## [2.45.0] — 2026-11-20
+
+Adds LACP to the switch: the two uplink ports can now be one 802.3ad bond.
+
+Thanks to [@danste22](https://github.com/danste22), who wrote the LACP uplink
+in [#50](https://github.com/excavador-turing/bmcd/pull/50); it was carried on
+as [#56](https://github.com/excavador-turing/bmcd/pull/56) with his original
+commits kept, under his authorship, and review fixes on top.
 
 ### Added
 
@@ -27,13 +31,13 @@ are kept in this branch, with their author.
   nodes' uploads on one member. With DHCP, `br0` gets
   `udhcpc-opts "-t 25 -T 2"` so the lease waits for LACP to reach
   Distributing. The confirm window watches `bond0`. LACP needs ifupdown-ng's
-  bond executor on the image. (thanks @danste22, #50)
+  bond executor on the image. (thanks [@danste22](https://github.com/danste22), [#50](https://github.com/excavador-turing/bmcd/pull/50)/[#56](https://github.com/excavador-turing/bmcd/pull/56))
 
 - **A confirmed switch change also writes `/etc/network/interfaces`.** One
   locked writer, shared with address confirm. A `# bmcd-switch:` header carries
   the document, and `bond0`, `bridge-ports` and the `post-up` lines come from
   it, so a reboot brings the bond and the VLANs up before this daemon starts.
-  (thanks @danste22, #50)
+  (thanks [@danste22](https://github.com/danste22), [#50](https://github.com/excavador-turing/bmcd/pull/50)/[#56](https://github.com/excavador-turing/bmcd/pull/56))
 
 - **A document without `second_uplink` is read one way, whatever it came in
   by.** The file on the overlay, the `interfaces` header and an API body all
