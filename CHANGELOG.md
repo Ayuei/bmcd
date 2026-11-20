@@ -24,6 +24,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   it gave no protection. A ban that already stands still refuses tokens.
   (thanks @cloudlabworks, #39)
 
+- **Confirmed config files are flushed to flash before rename.**
+  `switch.json`, `/etc/network/interfaces`, access overrides, the managed
+  client CA, and TLS key/cert pairs were written with temp+rename and no
+  `fsync`. On the UBIFS overlay a power cut just after confirm could leave a
+  correctly named empty or truncated file — Flat with no UI error for the
+  switch document, or no network at boot for `interfaces`. One helper,
+  `write_durably`, now syncs the data and the directory (one `<name>.tmp`
+  per target, opened exclusively, a stale one from an interrupted write
+  removed first; a directory sync failure after rename is logged, not
+  treated as a failed write). (thanks @danste22, #48 and #51)
+
 ## [2.43.0] — 2026-11-14
 
 Answers <https://github.com/excavador-turing/BMC-Firmware/issues/76>.
