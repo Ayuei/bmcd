@@ -10,6 +10,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The switch rollback paths are now covered by tests.** A confirm whose
+  `switch.json` write fails keeps the change pending (and the same token
+  confirms once the disk allows it, or the window puts the old configuration
+  back); an apply that fails in the middle of a plan runs the way back and
+  reports the first error; the timer's revert goes on past a failing command.
+  The behaviour itself shipped in 2.45.0; this pins it.
+
 ## [2.46.0] — 2026-11-20
 
 A reboot of the BMC on the 6.18 kernel is no longer read as a cold boot.
