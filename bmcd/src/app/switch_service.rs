@@ -1729,4 +1729,203 @@ mod tests {
             }
         );
     }
+
+    // ---- confirm: a switch.json that cannot be written --------------------
+
+    /// Stop `write_durably` from writing `path`: its temp file is `<name>.tmp`,
+    /// and a directory of that name cannot be removed as a stale file, so the
+    /// write fails for root too.
+    fn block_writes_to(path: &Path) -> PathBuf {
+        let mut name = path.file_name().expect("a file name").to_os_string();
+        name.push(".tmp");
+        let blocker = path.with_file_name(name);
+        std::fs::create_dir(&blocker).unwrap();
+        blocker
+    }
+
+    /// The write of `switch.json` fails: the change is not consumed. It stays
+    /// pending, so the board is not left running a configuration with no
+    /// window to put it back, and the same token confirms once the disk
+    /// allows it.
+    #[tokio::test]
+    async fn a_failed_switch_json_write_keeps_the_change_pending() {
+        let rig = rig("switch-confirm-json-fail", false, false, None);
+        let pending = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("apply");
+        let blocker = block_writes_to(&rig.switch);
+
+        let error = rig
+            .service
+            .confirm(&pending.token)
+            .await
+            .expect_err("the write fails");
+        assert!(matches!(error, SwitchError::Io(_)), "{error}");
+        assert!(!rig.switch.exists(), "switch.json not written");
+        let view = rig.service.view().await;
+        assert_eq!(
+            view.pending.map(|p| p.token),
+            Some(pending.token.clone()),
+            "still pending, same token"
+        );
+        assert_eq!(view.confirmed, None, "nothing was confirmed");
+        assert_eq!(view.running, trunk(), "the board is still running it");
+
+        std::fs::remove_dir(blocker).unwrap();
+        rig.service
+            .confirm(&pending.token)
+            .await
+            .expect("the retry goes through");
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none());
+        assert_eq!(view.confirmed, Some(trunk()));
+        assert!(rig.switch.exists());
+    }
+
+    /// Without a retry the window still does its job: the change that could
+    /// not be saved is put back when the time is up.
+    #[tokio::test]
+    async fn a_change_whose_confirm_could_not_write_is_still_reverted_by_the_timer() {
+        let rig = rig("switch-confirm-json-timer", false, false, None);
+        let pending = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("apply");
+        let _blocker = block_writes_to(&rig.switch);
+        rig.service
+            .confirm(&pending.token)
+            .await
+            .expect_err("the write fails");
+
+        rig.exec.forget();
+        rig.service
+            .tick_at(pending.applied_at + DEFAULT_WINDOW + START_CEILING)
+            .await;
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none(), "put back");
+        assert_eq!(view.running, Preset::flat().expand());
+        assert!(
+            rig.exec
+                .ran_any("bridge vlan add dev ge1 vid 1 pvid untagged"),
+            "{:#?}",
+            rig.exec.ran()
+        );
+    }
+
+    // ---- an apply that fails part-way -------------------------------------
+
+    /// The last step of a Flat to Trunk plan turns filtering on. When that is
+    /// the one that fails, every VLAN has already been rewritten: the way back
+    /// has to run, after the failure, and the change must not stay pending.
+    #[tokio::test]
+    async fn an_apply_that_fails_in_the_middle_runs_the_way_back() {
+        let rig = rig("switch-apply-midway", false, false, None);
+        rig.exec.fail("vlan_filtering 1");
+
+        let error = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("filtering cannot be turned on");
+        assert!(matches!(error, SwitchError::Command { .. }), "{error}");
+
+        let ran = rig.exec.ran();
+        let failed_at = ran
+            .iter()
+            .position(|c| c.contains("vlan_filtering 1"))
+            .expect("the failing step ran");
+        let back = &ran[failed_at + 1..];
+        assert!(
+            back.iter().any(|c| c.contains("vlan_filtering 0")),
+            "the way back starts by turning filtering off: {ran:#?}"
+        );
+        assert!(
+            back.contains(&"bridge vlan add dev ge1 vid 1 pvid untagged".to_string()),
+            "the VLANs the plan removed are put back: {ran:#?}"
+        );
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none(), "no change is left pending");
+        assert_eq!(view.running, Preset::flat().expand());
+    }
+
+    /// A step in the middle of the plan fails: the steps after it never ran,
+    /// and the way back is best effort, so it goes past the errors its own
+    /// steps meet and still reports the original failure.
+    #[tokio::test]
+    async fn the_way_back_goes_past_a_step_that_fails_and_reports_the_first_error() {
+        let rig = rig("switch-apply-midway-undo", false, false, None);
+        rig.exec.fail("bridge vlan add dev ge0 vid 10");
+        // The way back also fails on its first VLAN step.
+        rig.exec.fail("bridge vlan del dev ge0 vid 10");
+
+        let error = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect_err("a VLAN cannot be added");
+        match error {
+            SwitchError::Command { command, .. } => {
+                assert!(
+                    command.contains("bridge vlan add dev ge0 vid 10"),
+                    "{command}"
+                )
+            }
+            other => panic!("not the first failure: {other}"),
+        }
+        assert!(
+            rig.exec
+                .ran()
+                .contains(&"bridge vlan add dev ge1 vid 1 pvid untagged".to_string()),
+            "the way back carried on past its own failure: {:#?}",
+            rig.exec.ran()
+        );
+        assert!(rig.service.view().await.pending.is_none());
+    }
+
+    // ---- the timer's revert is best effort too ----------------------------
+
+    /// The timer reaches the same `carry_out` as a requested revert: it goes
+    /// on past the step that fails, and reports what the kernel holds as
+    /// running.
+    #[tokio::test]
+    async fn the_timer_revert_carries_on_past_a_failing_command() {
+        let rig = rig("switch-timer-best-effort", true, false, None);
+        let pending = rig
+            .service
+            .apply(trunk(), DEFAULT_WINDOW, false)
+            .await
+            .expect("apply");
+
+        rig.exec.fail("bridge vlan del dev ge0 vid 10");
+        std::fs::write(rig.dir.path().join("net/br0/bridge/vlan_filtering"), "0\n").unwrap();
+        rig.exec.set_vlans(
+            r#"[{"ifname":"ge0","vlans":[{"vlan":1,"flags":["PVID","Egress Untagged"]},{"vlan":10}]}]"#,
+        );
+        rig.exec.forget();
+
+        rig.service
+            .tick_at(pending.applied_at + DEFAULT_WINDOW + START_CEILING)
+            .await;
+
+        assert!(
+            rig.exec
+                .ran()
+                .contains(&"bridge vlan add dev ge1 vid 1 pvid untagged".to_string()),
+            "the steps after the failure still ran: {:#?}",
+            rig.exec.ran()
+        );
+        let view = rig.service.view().await;
+        assert!(view.pending.is_none());
+        assert!(!view.running.vlan_filtering);
+        assert_eq!(
+            view.running.ports[&PortId::Ge0],
+            crate::app::switch_document::PortConfig {
+                untagged: Some(1),
+                tagged: [10].into_iter().collect()
+            }
+        );
+    }
 }
