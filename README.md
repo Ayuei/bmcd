@@ -452,15 +452,17 @@ The toolchain is pinned to **Rust 1.98.1** in `rust-toolchain.toml`, and
 Buildroot toolchain, not about this repo — and it has to happen together with
 `Cargo.lock`, `cargo_ci.yml` and `bmcd.hash`.
 
-Three advisories are still open in the lockfile. One of them has since been
-closed off in the daemon rather than in the dependency; the other two are
-**declined**, each because closing it needs a major bump or a toolchain move:
+Two advisories are still open in the lockfile. One of them has since been
+closed off in the daemon rather than in the dependency; the other is
+**declined**, because closing it means replacing a dev-dependency:
 
 | advisory | reachable here? | why it is still open |
 |---|---|---|
 | `h2` 0.3.27 — RUSTSEC-2026-0258, unbounded empty DATA frames | **No longer.** It was, and pre-authentication: `bind_openssl` advertised `h2` over ALPN, so a peer reached HTTP/2 framing before the auth middleware ran. The listener now offers `http/1.1` and nothing else, and is built from an `HttpService` with `.h1()`, so the HTTP/2 dispatcher is never constructed — see the row on it above | Still no fix at any version. The patch is in `h2 >= 0.4.16`, and every `actix-http` up to the newest (3.13.5) still pins `h2` 0.3.27, so only an actix-web 5 migration or an upstream backport takes the advisory off the list. The crate is compiled into the binary and unreachable; dropping actix-web's default `http2` feature would take it out of the graph entirely and is its own decision |
-| `time` 0.3.45 — RUSTSEC-2026-0009, stack exhaustion | No. The flaw is in the RFC 2822 parse path; nothing in the graph uses it. actix parses HTTP dates with `httpdate`, `tracing-appender` only formats its own filename suffixes, and bmcd never touches cookies | Patched 0.3.47 requires rustc 1.88 |
 | `remove_dir_all` 0.5.3 — RUSTSEC-2023-0018, TOCTOU | No. It arrives via the `tempdir` **dev-dependency** and is not in the shipped binary | Fixing it means replacing `tempdir` with `tempfile`, a test-code change left for its own decision |
+
+`time` is no longer on the list: RUSTSEC-2026-0009 (stack exhaustion in the
+RFC 2822 parser) is fixed in 0.3.47, and `Cargo.lock` now resolves 0.3.55.
 
 Three warnings remain, none of them reachable as written: `bincode` and
 `tempdir` are unmaintained (the first reads a local persistency file, the
